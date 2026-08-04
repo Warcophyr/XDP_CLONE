@@ -4,3 +4,6 @@
 [submodule "mellanox-clone-xdp"]
 	path = mellanox-clone-xdp
 	url = https://github.com/Warcophyr/mellanox-clone-xdp.git
+[submodule "XuDP"]
+	path = XuDP
+	url = https://github.com/Warcophyr/XDP-MPI-Collectives.git
