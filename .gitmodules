@@ -1,0 +1,6 @@
+[submodule "bpf-broker"]
+	path = bpf-broker
+	url = https://github.com/VladimiroPaschali/bpf-broker.git
+[submodule "mellanox-clone-xdp"]
+	path = mellanox-clone-xdp
+	url = https://github.com/Warcophyr/mellanox-clone-xdp.git
