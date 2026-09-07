@@ -115,7 +115,3 @@ cd ../script && sudo ./load_tc_ingress_logger.sh
 ```
 
 Tested on Ubuntu 24.04 / Linux 6.8.x. The `mqttsn-udp-sr` subfolder is a separate, dependency-light Rust reference implementation (`cargo run --bin broker|publisher|subscriber`) useful for comparing against the BPF-accelerated path without any kernel setup.
-
-## License
-
-MIT, see [LICENSE](LICENSE). Each submodule may carry its own license file, so check the submodule directories for details.
