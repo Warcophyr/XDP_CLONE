@@ -11,6 +11,7 @@ kernel/
 ├── patches/0001-bpf-verify-XDP-clone-actions-against-the-data_meta-c.patch
 ├── setup.sh     clone the base kernel and apply the patch
 ├── build.sh     configure and build it out of tree
+├── tests/       programs the verifier must accept and reject, plus run.sh
 └── README.md
 ```
 
@@ -178,6 +179,34 @@ make KDIR=~/linux-6.8.0-60.63-build
 > same as the distro kernel's, that would overwrite
 > `/boot/vmlinuz-6.8.0-60-generic` and `/lib/modules/6.8.0-60-generic`, i.e. the
 > kernel the host boots from. Testing in a VM needs no installation at all.
+
+## Tests
+
+`tests/` holds one small program per rule. Each one carries the expected outcome
+on an `EXPECT:` line, and `run.sh` compiles it, tries to load it and compares:
+
+```console
+# cd kernel/tests && sudo ./run.sh -v
+kernel: 6.8.0-60-generic
+ok        t1_clone_ok          ACCEPT
+ok        t2_nested            REJECT
+...
+```
+
+| test | expected | why |
+|---|---|---|
+| `t1_clone_ok` | ACCEPT | clone on the branch where the metadata is absent |
+| `t2_nested` | REJECT | nested clone: asked for while running on a copy |
+| `t3_nocheck` | REJECT | no `data_meta` check at all |
+| `t4_bigcheck` | REJECT | the check covers 8 bytes, so it does not rule out a copy |
+| `t5_adjust` | REJECT | metadata dropped with `bpf_xdp_adjust_meta()` before checking |
+| `t6_runtime_count` | ACCEPT | number of copies computed at runtime is fine |
+| `t7_reversed` | ACCEPT | same check with the operands swapped, `XDP_CLONE_PASS` |
+| `t8_runtime_action` | ACCEPT | documented limitation: action computed at runtime |
+
+Run them inside the VM on the patched kernel; needs root, `clang`, libbpf
+headers and `bpftool`. On a stock kernel every program loads, so the four
+REJECT rows fail — which is itself a way to tell the two kernels apart.
 
 ## License
 
