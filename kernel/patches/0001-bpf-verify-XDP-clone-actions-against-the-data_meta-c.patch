@@ -1,0 +1,469 @@
+From aa757d0c71348360c51fc8dbbf242dcb1ed29c67 Mon Sep 17 00:00:00 2001
+From: VladimiroPaschali <vladimiropaschali@gmail.com>
+Date: Mon, 7 Sep 2026 14:22:23 +0000
+Subject: [PATCH] bpf: verify XDP clone actions against the data_meta check
+
+---
+ include/linux/bpf_verifier.h   |  27 ++++
+ include/uapi/linux/bpf.h       |  25 ++++
+ kernel/bpf/verifier.c          | 262 ++++++++++++++++++++++++++++++++-
+ tools/include/uapi/linux/bpf.h |  25 ++++
+ 4 files changed, 337 insertions(+), 2 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 0cd4f900e..49227388e 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -363,6 +363,27 @@ struct bpf_jmp_history_entry {
+ 	u32 flags : 10;
+ };
+ 
++/* What a xdp_md->data_meta vs xdp_md->data comparison proved on the path that
++ * leads to a given verifier state.
++ *
++ * An XDP program that asks the driver to duplicate a packet (XDP_CLONE_PASS /
++ * XDP_CLONE_TX) is re-run on every copy with XDP_CLONE_META_SIZE bytes of
++ * driver metadata in front of the packet. A clone action is therefore only
++ * allowed on a path where the program proved that no such metadata is
++ * present, i.e. where it knows it is looking at an original packet and not at
++ * one of its own copies. See check_xdp_clone_retval().
++ */
++enum bpf_xdp_meta_check {
++	/* no data_meta vs data comparison on this path */
++	BPF_XDP_META_UNCHECKED = 0,
++	/* metadata area proved to be >= bpf_verifier_state::xdp_meta_range */
++	BPF_XDP_META_PRESENT,
++	/* metadata area proved to be < bpf_verifier_state::xdp_meta_range */
++	BPF_XDP_META_ABSENT,
++	/* program moved data_meta itself, earlier knowledge is void */
++	BPF_XDP_META_ADJUSTED,
++};
++
+ /* Maximum number of register states that can exist at once */
+ #define BPF_ID_MAP_SIZE ((MAX_BPF_REG + MAX_BPF_STACK / BPF_REG_SIZE) * MAX_CALL_FRAMES)
+ struct bpf_verifier_state {
+@@ -449,6 +470,12 @@ struct bpf_verifier_state {
+ 	u32 jmp_history_cnt;
+ 	u32 dfs_depth;
+ 	u32 callback_unroll_depth;
++	/* XDP packet duplication tracking: what the program knows about its
++	 * metadata area on the path that reaches this state, and the size the
++	 * data_meta vs data comparison was done against.
++	 */
++	enum bpf_xdp_meta_check xdp_meta_check;
++	u16 xdp_meta_range;
+ };
+ 
+ #define bpf_get_spilled_reg(slot, frame, mask)				\
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 53938b77a..8dbde0454 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -6337,8 +6337,33 @@ enum xdp_action {
+ 	XDP_PASS,
+ 	XDP_TX,
+ 	XDP_REDIRECT,
++	/* Packet duplication actions. The driver re-runs the program once per
++	 * requested copy, so the number of copies is encoded in the upper bits
++	 * of the return value:
++	 *
++	 *	return (n_copies << XDP_CLONE_NUM_SHIFT) | XDP_CLONE_TX;
++	 *
++	 * Before re-running the program on a copy the driver stores
++	 * XDP_CLONE_META_SIZE bytes of metadata in front of xdp_md->data, so
++	 * that the program can tell a copy from the original packet. The
++	 * verifier only accepts a clone action on a path where the program
++	 * proved that this metadata is not there, which also rules out
++	 * nested clones.
++	 */
++	XDP_CLONE_PASS,
++	XDP_CLONE_TX,
+ };
+ 
++/* Bits of an XDP return value that hold the action; the remaining upper bits
++ * hold the number of copies for XDP_CLONE_PASS / XDP_CLONE_TX.
++ */
++#define XDP_CLONE_NUM_SHIFT	5
++#define XDP_CLONE_ACT_MASK	((1U << XDP_CLONE_NUM_SHIFT) - 1)
++/* Bytes of metadata the driver stores in front of xdp_md->data before it
++ * re-runs the program on a copy of the packet.
++ */
++#define XDP_CLONE_META_SIZE	4
++
+ /* user accessible metadata for XDP packet hook
+  * new fields must be added to the end of this structure
+  */
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index aed70d910..b1fa8f1f3 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1421,6 +1421,8 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
+ 	dst_state->dfs_depth = src->dfs_depth;
+ 	dst_state->callback_unroll_depth = src->callback_unroll_depth;
+ 	dst_state->used_as_loop_entry = src->used_as_loop_entry;
++	dst_state->xdp_meta_check = src->xdp_meta_check;
++	dst_state->xdp_meta_range = src->xdp_meta_range;
+ 	for (i = 0; i <= src->curframe; i++) {
+ 		dst = dst_state->frame[i];
+ 		if (!dst) {
+@@ -10132,6 +10134,42 @@ static void update_loop_inline_state(struct bpf_verifier_env *env, u32 subprogno
+ 				 state->callback_subprogno == subprogno);
+ }
+ 
++/* Extract the action out of an XDP return value. The upper bits of the value
++ * carry the number of copies for the packet duplication actions, so only the
++ * low XDP_CLONE_NUM_SHIFT bits are the action itself. Returns tnum_unknown
++ * when the action is not known at verification time.
++ */
++static struct tnum xdp_retval_action(const struct bpf_reg_state *reg)
++{
++	if (reg->type != SCALAR_VALUE)
++		return tnum_unknown;
++
++	return tnum_and(reg->var_off, tnum_const(XDP_CLONE_ACT_MASK));
++}
++
++static bool xdp_action_is_clone(u64 act)
++{
++	return act == XDP_CLONE_PASS || act == XDP_CLONE_TX;
++}
++
++/* An XDP program that shrinks its own metadata area cannot be trusted to tell
++ * an original packet from a copy anymore, see try_mark_xdp_meta_check().
++ */
++static void mark_xdp_meta_adjusted(struct bpf_verifier_env *env,
++				   const struct bpf_reg_state *off_reg)
++{
++	if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_XDP)
++		return;
++	/* A negative offset only grows the metadata area, it can never turn a
++	 * packet that carries clone metadata into one that doesn't.
++	 */
++	if (off_reg->type == SCALAR_VALUE && off_reg->s32_max_value <= 0)
++		return;
++
++	env->cur_state->xdp_meta_check = BPF_XDP_META_ADJUSTED;
++	env->cur_state->xdp_meta_range = 0;
++}
++
+ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn,
+ 			     int *insn_idx_p)
+ {
+@@ -10444,6 +10482,10 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ 	if (err)
+ 		return err;
+ 
++	/* Has to be done while the offset argument is still around. */
++	if (func_id == BPF_FUNC_xdp_adjust_meta)
++		mark_xdp_meta_adjusted(env, &regs[BPF_REG_2]);
++
+ 	/* reset caller saved regs */
+ 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
+ 		mark_reg_not_init(env, regs, caller_saved[i]);
+@@ -14771,7 +14813,106 @@ static void mark_ptr_or_null_regs(struct bpf_verifier_state *vstate, u32 regno,
+ 	}));
+ }
+ 
+-static bool try_match_pkt_pointers(const struct bpf_insn *insn,
++/* Record what a xdp_md->data_meta vs xdp_md->data comparison proved on each
++ * branch, so that check_xdp_clone_retval() can tell an original packet from
++ * one of the copies the program asked for earlier, e.g.
++ *
++ *	if (ctx->data_meta + sizeof(__u32) <= ctx->data)
++ *		... this is a copy, it must not ask for more copies ...
++ *	else
++ *		return XDP_CLONE_TX(n);
++ *
++ * The branch that gets the packet range in try_match_pkt_pointers() is the
++ * one where the metadata is known to be there, the other one is where it is
++ * (partially) missing. Only the size the comparison was made against matters,
++ * pointers themselves are not tracked across the exit.
++ */
++static void try_mark_xdp_meta_check(struct bpf_verifier_env *env,
++				    const struct bpf_insn *insn,
++				    struct bpf_reg_state *dst_reg,
++				    struct bpf_reg_state *src_reg,
++				    struct bpf_verifier_state *this_branch,
++				    struct bpf_verifier_state *other_branch)
++{
++	struct bpf_verifier_state *present, *absent;
++	const struct bpf_reg_state *meta_reg;
++	bool meta_on_dst, range_right_open;
++	u64 range;
++
++	if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_XDP)
++		return;
++
++	if (dst_reg->type == PTR_TO_PACKET_META &&
++	    reg_is_init_pkt_pointer(src_reg, PTR_TO_PACKET))
++		meta_on_dst = true;
++	else if (src_reg->type == PTR_TO_PACKET_META &&
++		 reg_is_init_pkt_pointer(dst_reg, PTR_TO_PACKET))
++		meta_on_dst = false;
++	else
++		return;
++
++	switch (BPF_OP(insn->code)) {
++	case BPF_JGT:	/* meta' > data, or data > meta' */
++		present = meta_on_dst ? this_branch : other_branch;
++		range_right_open = !meta_on_dst;
++		break;
++	case BPF_JLT:	/* meta' < data, or data < meta' */
++		present = meta_on_dst ? other_branch : this_branch;
++		range_right_open = meta_on_dst;
++		break;
++	case BPF_JGE:	/* meta' >= data, or data >= meta' */
++		present = meta_on_dst ? this_branch : other_branch;
++		range_right_open = meta_on_dst;
++		break;
++	case BPF_JLE:	/* meta' <= data, or data <= meta' */
++		present = meta_on_dst ? other_branch : this_branch;
++		range_right_open = !meta_on_dst;
++		break;
++	default:
++		return;
++	}
++	absent = present == this_branch ? other_branch : this_branch;
++
++	meta_reg = meta_on_dst ? dst_reg : src_reg;
++	if (meta_reg->off < 0)
++		return;
++	/* umin_value keeps a variable offset on the safe side: the metadata
++	 * area is at least this big on the 'present' branch and smaller than
++	 * that on the 'absent' one.
++	 */
++	range = (u64)meta_reg->off + meta_reg->umin_value;
++	if (range_right_open)
++		range++;
++	if (range > U16_MAX)
++		range = U16_MAX;
++
++	/* BPF_XDP_META_ADJUSTED is sticky: once the program moved data_meta
++	 * around, a later comparison says nothing about what the driver put
++	 * there before the program ran.
++	 */
++	if (present->xdp_meta_check != BPF_XDP_META_ADJUSTED) {
++		u16 present_range = range;
++
++		/* keep the strongest fact known on this path */
++		if (present->xdp_meta_check == BPF_XDP_META_PRESENT)
++			present_range = max_t(u16, present->xdp_meta_range,
++					      present_range);
++		present->xdp_meta_check = BPF_XDP_META_PRESENT;
++		present->xdp_meta_range = present_range;
++	}
++	if (absent->xdp_meta_check != BPF_XDP_META_ADJUSTED) {
++		u16 absent_range = range;
++
++		if (absent->xdp_meta_check == BPF_XDP_META_ABSENT)
++			absent_range = min_t(u16, absent->xdp_meta_range,
++					     absent_range);
++		absent->xdp_meta_check = BPF_XDP_META_ABSENT;
++		absent->xdp_meta_range = absent_range;
++	}
++}
++
++static bool try_match_pkt_pointers(struct bpf_verifier_env *env,
++				   const struct bpf_insn *insn,
+ 				   struct bpf_reg_state *dst_reg,
+ 				   struct bpf_reg_state *src_reg,
+ 				   struct bpf_verifier_state *this_branch,
+@@ -14873,6 +15014,9 @@ static bool try_match_pkt_pointers(const struct bpf_insn *insn,
+ 		return false;
+ 	}
+ 
++	try_mark_xdp_meta_check(env, insn, dst_reg, src_reg, this_branch,
++				other_branch);
++
+ 	return true;
+ }
+ 
+@@ -15078,7 +15222,7 @@ static int check_cond_jmp_op(struct bpf_verifier_env *env,
+ 				      opcode == BPF_JNE);
+ 		mark_ptr_or_null_regs(other_branch, insn->dst_reg,
+ 				      opcode == BPF_JEQ);
+-	} else if (!try_match_pkt_pointers(insn, dst_reg, &regs[insn->src_reg],
++	} else if (!try_match_pkt_pointers(env, insn, dst_reg, &regs[insn->src_reg],
+ 					   this_branch, other_branch) &&
+ 		   is_pointer_value(env, insn->dst_reg)) {
+ 		verbose(env, "R%d pointer comparison prohibited\n",
+@@ -15292,6 +15436,75 @@ static int check_ld_abs(struct bpf_verifier_env *env, struct bpf_insn *insn)
+ 	return 0;
+ }
+ 
++/* XDP programs may return anything: an action the driver does not know about
++ * is turned into a drop and a warning at runtime. The packet duplication
++ * actions are the exception. The driver re-runs the program on every copy it
++ * makes, with XDP_CLONE_META_SIZE bytes of metadata in front of the packet,
++ * so asking for copies is only safe on a path where the program proved that
++ * this metadata is not there:
++ *
++ *	if (ctx->data_meta + XDP_CLONE_META_SIZE <= ctx->data)
++ *		...  running on a copy, must not clone again  ...
++ *	return XDP_CLONE_TX(n);
++ *
++ * That rules out nested clones (a copy asking for more copies) and forces the
++ * program to look at data_meta before it duplicates a packet.
++ *
++ * Programs that compute the action at runtime are not covered: the driver
++ * still has to reject a clone action coming from a copy.
++ */
++static int check_xdp_clone_retval(struct bpf_verifier_env *env, int regno,
++				  const char *reg_name)
++{
++	struct bpf_verifier_state *state = env->cur_state;
++	struct bpf_reg_state *reg = cur_regs(env) + regno;
++	struct tnum act = xdp_retval_action(reg);
++	const char *act_name;
++	int err;
++
++	if (!tnum_is_const(act) || !xdp_action_is_clone(act.value))
++		return 0;
++
++	act_name = act.value == XDP_CLONE_PASS ? "XDP_CLONE_PASS" : "XDP_CLONE_TX";
++
++	/* Everything below depends on the exact value in the return register,
++	 * make sure that state pruning keeps this exit apart from the others.
++	 */
++	err = mark_chain_precision(env, regno);
++	if (err)
++		return err;
++
++	switch (state->xdp_meta_check) {
++	case BPF_XDP_META_ABSENT:
++		/* The comparison only proves that the metadata area is
++		 * smaller than xdp_meta_range bytes, which tells an original
++		 * packet from a copy only if it covers the whole clone
++		 * metadata.
++		 */
++		if (state->xdp_meta_range > XDP_CLONE_META_SIZE) {
++			verbose(env, "At program exit %s returns %s, but the xdp_md->data_meta check covers %u bytes, at most %u are allowed to tell a cloned packet apart\n",
++				reg_name, act_name, state->xdp_meta_range,
++				(u32)XDP_CLONE_META_SIZE);
++			return -EINVAL;
++		}
++		return 0;
++	case BPF_XDP_META_PRESENT:
++		verbose(env, "At program exit %s returns %s on a packet carrying %u bytes of metadata, this is a copy and nested clones are not allowed\n",
++			reg_name, act_name, state->xdp_meta_range);
++		return -EINVAL;
++	case BPF_XDP_META_ADJUSTED:
++		verbose(env, "At program exit %s returns %s after bpf_xdp_adjust_meta(), a cloned packet can no longer be told apart\n",
++			reg_name, act_name);
++		return -EINVAL;
++	case BPF_XDP_META_UNCHECKED:
++	default:
++		verbose(env, "At program exit %s returns %s without checking xdp_md->data_meta, %s is only allowed where 'ctx->data_meta + %u > ctx->data' holds\n",
++			reg_name, act_name, act_name,
++			(u32)XDP_CLONE_META_SIZE);
++		return -EINVAL;
++	}
++}
++
+ static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name)
+ {
+ 	const char *exit_ctx = "At program exit";
+@@ -15427,6 +15640,12 @@ static int check_return_code(struct bpf_verifier_env *env, int regno, const char
+ 	case BPF_PROG_TYPE_NETFILTER:
+ 		range = retval_range(NF_DROP, NF_ACCEPT);
+ 		break;
++	case BPF_PROG_TYPE_XDP:
++		/* Only the packet duplication actions are restricted, every
++		 * other value is left to the driver, see
++		 * bpf_warn_invalid_xdp_action().
++		 */
++		return check_xdp_clone_retval(env, regno, reg_name);
+ 	case BPF_PROG_TYPE_EXT:
+ 		/* freplace program can return anything as its return value
+ 		 * depends on the to-be-replaced kernel func or bpf program.
+@@ -16732,6 +16951,35 @@ static void reset_idmap_scratch(struct bpf_verifier_env *env)
+ 	memset(&env->idmap_scratch.map, 0, sizeof(env->idmap_scratch.map));
+ }
+ 
++/* An exit that returns a packet duplication action must be looked at by
++ * check_xdp_clone_retval() with the data_meta knowledge of its own path.
++ * A scalar R0 that is not precise subsumes any other value in regsafe(), so
++ * such an exit would otherwise be pruned against one that returned, say, the
++ * result of bpf_redirect().
++ */
++static bool xdp_clone_exit_differs(struct bpf_verifier_env *env,
++				   struct bpf_verifier_state *old,
++				   struct bpf_verifier_state *cur)
++{
++	struct tnum old_act, cur_act;
++
++	if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_XDP)
++		return false;
++	if (cur->curframe != 0 ||
++	    env->prog->insnsi[env->insn_idx].code != (BPF_JMP | BPF_EXIT))
++		return false;
++
++	cur_act = xdp_retval_action(&cur->frame[0]->regs[BPF_REG_0]);
++	if (!tnum_is_const(cur_act) || !xdp_action_is_clone(cur_act.value))
++		return false;
++
++	/* Same action and, given the checks below, same data_meta knowledge:
++	 * the already verified exit covers this one too.
++	 */
++	old_act = xdp_retval_action(&old->frame[0]->regs[BPF_REG_0]);
++	return !tnum_equals_const(old_act, cur_act.value);
++}
++
+ static bool states_equal(struct bpf_verifier_env *env,
+ 			 struct bpf_verifier_state *old,
+ 			 struct bpf_verifier_state *cur,
+@@ -16742,6 +16990,16 @@ static bool states_equal(struct bpf_verifier_env *env,
+ 	if (old->curframe != cur->curframe)
+ 		return false;
+ 
++	/* States that know different things about the XDP metadata area lead
++	 * to different verdicts in check_xdp_clone_retval().
++	 */
++	if (old->xdp_meta_check != cur->xdp_meta_check ||
++	    old->xdp_meta_range != cur->xdp_meta_range)
++		return false;
++
++	if (xdp_clone_exit_differs(env, old, cur))
++		return false;
++
+ 	reset_idmap_scratch(env);
+ 
+ 	/* Verification state from speculative execution simulation
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 4ac315daa..2739b9896 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -6340,8 +6340,33 @@ enum xdp_action {
+ 	XDP_PASS,
+ 	XDP_TX,
+ 	XDP_REDIRECT,
++	/* Packet duplication actions. The driver re-runs the program once per
++	 * requested copy, so the number of copies is encoded in the upper bits
++	 * of the return value:
++	 *
++	 *	return (n_copies << XDP_CLONE_NUM_SHIFT) | XDP_CLONE_TX;
++	 *
++	 * Before re-running the program on a copy the driver stores
++	 * XDP_CLONE_META_SIZE bytes of metadata in front of xdp_md->data, so
++	 * that the program can tell a copy from the original packet. The
++	 * verifier only accepts a clone action on a path where the program
++	 * proved that this metadata is not there, which also rules out
++	 * nested clones.
++	 */
++	XDP_CLONE_PASS,
++	XDP_CLONE_TX,
+ };
+ 
++/* Bits of an XDP return value that hold the action; the remaining upper bits
++ * hold the number of copies for XDP_CLONE_PASS / XDP_CLONE_TX.
++ */
++#define XDP_CLONE_NUM_SHIFT	5
++#define XDP_CLONE_ACT_MASK	((1U << XDP_CLONE_NUM_SHIFT) - 1)
++/* Bytes of metadata the driver stores in front of xdp_md->data before it
++ * re-runs the program on a copy of the packet.
++ */
++#define XDP_CLONE_META_SIZE	4
++
+ /* user accessible metadata for XDP packet hook
+  * new fields must be added to the end of this structure
+  */
