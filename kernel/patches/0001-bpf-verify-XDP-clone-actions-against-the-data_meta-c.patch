@@ -1,8 +1,10 @@
-From aa757d0c71348360c51fc8dbbf242dcb1ed29c67 Mon Sep 17 00:00:00 2001
+From 7bc24747b82d2854b0e5ebc99361c8bf3996b14b Mon Sep 17 00:00:00 2001
 From: VladimiroPaschali <vladimiropaschali@gmail.com>
-Date: Mon, 7 Sep 2026 14:22:23 +0000
+Date: Mon, 7 Sep 2026 14:42:25 +0000
 Subject: [PATCH] bpf: verify XDP clone actions against the data_meta check
 
+Nested cloning is not accepted, and a check on xdp_md->data_meta is
+required before a clone action.
 ---
  include/linux/bpf_verifier.h   |  27 ++++
  include/uapi/linux/bpf.h       |  25 ++++
