@@ -140,6 +140,20 @@ int inline_xdp_clone(struct xdp_md *ctx) {
   if ((void *)(udph + 1) > data_end)
     return XDP_DROP;
 
+  /* No copies asked for: a plain XDP_TX, not XDP_CLONE_TX(0). It is the same
+   * one frame out either way, but the clone action costs the copy-count write
+   * and the whole XDP_CLONE_TX tail in the driver, and measurably so. With
+   * MODE 0 there is no header to stamp either, which makes this row the same
+   * code path as ../xdp-clone at copies=0 -- a shared reference point.
+   */
+  if (n_clone == 0) {
+#if MODE
+    if (stamp(ctx, 0))
+      return XDP_DROP;
+#endif
+    return XDP_TX;
+  }
+
   /* The stamp on the original is the request for the shared-page path. Without
    * it the driver would give every copy a page and a byte copy of the packet,
    * which is precisely ../xdp-clone.

@@ -175,12 +175,15 @@ int inline_xdp_clone(struct xdp_md *ctx) {
   if (n_clone != 0 && (void *)(payload + TSTAMP_MIN_PAYLOAD) <= data_end)
     payload[TSTAMP_MAGIC_OFF] = 0x00;
 
-  /* No copies asked for: a standard XDP_TX and nothing else, so that the
-   * copies=0 point is a plain transmission and the same reference in every
-   * application. No inline header either -- the original of a clone batch
-   * could not carry a descriptor anyway, since the driver writes the copy count
-   * over it after this run, so the header only ever rides on the copies.
+  /* No copies asked for: a plain XDP_TX, not XDP_CLONE_TX(0). It is the same
+   * one frame out either way, but the clone action costs the copy-count write
+   * and the whole XDP_CLONE_TX tail in the driver, and measurably so. No
+   * inline header either: there are no copies for one to ride on, so this row
+   * is the same code path as ../xdp-clone-tstamp at copies=0.
    */
+  if (n_clone == 0)
+    return XDP_TX;
+
   return XDP_CLONE_TX(n_clone);
 }
 

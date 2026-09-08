@@ -74,19 +74,29 @@ LATENCY_APPS = {
 }
 
 THROUGHPUT_APPS = {
-    "xdp-clone": {
-        "base_command": app("xdp-clone", "xdp_clone"),
-        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
-    },
-    "inline-xdp-clone": {
-        "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
-        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
-        "inline": True,
-    },
+    # "xdp-clone": {
+    #     "base_command": app("xdp-clone", "xdp_clone"),
+    #     "clones": [0, 1, 2, 4, 8, 16, 32, 64],
+    # },
+    # "inline-xdp-clone": {
+    #     "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
+    #     "clones": [0, 1, 2, 4, 8, 16, 32, 64],
+    #     "inline": True,
+    # },
     # "tc-clone": {
     #     "base_command": app("tc-clone", "tc_clone"),
     #     "clones": [0, 1, 2, 4, 8, 16, 32, 64],
     # },
+    "inline-xdp-clone": {
+                "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
+                "clones": [0],
+                "inline": True,
+            },
+    "xdp-clone": {
+            "base_command": app("xdp-clone", "xdp_clone"),
+            "clones": [0],
+        },
+        
 }
 
 

@@ -1,1 +1,6 @@
 __pycache__/
+
+# Measurement output. Regenerated on every run and never worth a merge
+# conflict; results/archive/ holds the CSVs from before the move and is kept on
+# disk, not in git.
+results/

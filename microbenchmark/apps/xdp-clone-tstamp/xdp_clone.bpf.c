@@ -98,6 +98,14 @@ int xdp_clone(struct xdp_md *ctx) {
   }
   
 
+  /* No copies asked for: a plain XDP_TX, not XDP_CLONE_TX(0). It is the same
+   * one frame out either way, but the clone action costs the copy-count write
+   * and the whole XDP_CLONE_TX tail in the driver, and measurably so -- that is
+   * what the copies=0 row of this benchmark was paying before.
+   */
+  if (n_clone == 0)
+    return XDP_TX;
+
   return XDP_CLONE_TX(n_clone);
 }
 

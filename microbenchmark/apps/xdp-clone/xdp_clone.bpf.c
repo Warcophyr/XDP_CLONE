@@ -67,6 +67,9 @@ int xdp_clone(struct xdp_md *ctx) {
     bpf_printk("XDP: UDP header validation failed\n");
     return XDP_DROP;
   }
+  if (n_clone == 0) {
+    return XDP_TX;
+  }
   return XDP_CLONE_TX(n_clone);
 }
 

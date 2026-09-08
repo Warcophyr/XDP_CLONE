@@ -10,7 +10,7 @@ microbenchmark/
 ├── no-drop-throughput.py   same search, plus a confirmation phase (NDR)
 ├── bench_common.py         paths, NIC preflight, app list, process handling
 ├── profiles/               TRex stream profiles
-├── results/                every CSV the scripts write
+├── results/                every CSV the scripts write (untracked)
 │   └── archive/            the CSVs from the runs before the move
 └── apps/
     ├── xdp-clone/                  XDP_CLONE_TX(n), copies go out as-is
@@ -90,9 +90,17 @@ queued for the earlier ones. So shared mode is measurable on throughput and NDR,
 not on latency, and the latency column measures the inline header on the copy
 path instead.
 
-At `copies=0` both applications return `XDP_CLONE_TX(0)`, so that row is the
-same code path in both: one transmission through the clone machinery with no
-copies.
+At `copies=0` every application here returns a plain `XDP_TX` rather than
+`XDP_CLONE_TX(0)`. It is the same one frame out either way, but the clone action
+costs the copy-count write and the whole `XDP_CLONE_TX` tail in the driver, and
+it costs it measurably: on this NIC the `copies=0` row went from 6.7 to 10.3
+Mpps of output when the plain action was used instead. So that row is now the
+plain-transmission reference, and the same code path in all of them.
+
+Worth keeping in mind when reading `copies=0` against the rest of a column: at
+one frame in and one frame out there is nothing to amortise the per-RX-packet
+cost over, which is why `xdp-clone` emits only ~6.7 Mpps there and ~10.6 Mpps at
+`copies=2`.
 
 ## What the flags are for
 
