@@ -47,23 +47,30 @@ def app(directory, binary):
 # sample per packet it sent instead of n+1 duplicates. Everything else uses the
 # plain builds.
 #
-# 'inline' marks the applications that ask the NIC for a WQE inline header, and
+# 'inline' marks the applications that stamp an A-XDP TX descriptor, and
 # therefore need xdp_tx_mpwqe off to be measuring anything at all.
+#
+# The two inline builds are not the same experiment. inline-xdp-clone stamps the
+# original, which puts the driver on its shared-page path: one page for the
+# whole batch, no memcpy per copy. inline-xdp-clone-tstamp cannot do that -- its
+# latency magic is a per-copy edit of the payload -- so it stamps on the copies
+# and stays on the copy path, measuring the inline header rather than the page.
+# See README.md.
 # ---------------------------------------------------------------------------
 LATENCY_APPS = {
     "xdp-clone": {
         "base_command": app("xdp-clone-tstamp", "xdp_clone"),
-        "clones": [0, 1, 2, 4, 8, 16, 32, 64, 128],
+        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
     },
     "inline-xdp-clone": {
         "base_command": app("inline-xdp-clone-tstamp", "inline_xdp_clone"),
-        "clones": [0, 1, 2, 4, 8, 16, 32, 64, 128],
+        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
         "inline": True,
     },
-    # "tc-clone": {
-    #     "base_command": app("tc-clone-tstamp", "tc_clone"),
-    #     "clones": [0, 1, 2, 4, 8, 16, 32, 64, 128],
-    # },
+    "tc-clone": {
+        "base_command": app("tc-clone-tstamp", "tc_clone"),
+        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
+    },
 }
 
 THROUGHPUT_APPS = {

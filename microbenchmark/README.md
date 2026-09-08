@@ -61,27 +61,38 @@ NIC as the WQE inline header instead of being DMA'd
 (`mellanox-clone-xdp/examples/inline-clone` documents the mechanism, and the
 apps here include its `axdp_tx.h`).
 
-The header is a **byte-identical copy** of the packet's own destination + source
-MAC pair, and the packet is shortened by exactly as much
-(`bpf_xdp_adjust_head`). The frame that leaves is therefore the frame
-`xdp-clone` would have sent: same length, same bytes, same fanout. Whatever
-difference shows up in the numbers is the cost of the mechanism — a wider WQE,
-the regular-WQE path instead of MPWQE, two extra helper calls — and not of a
-different workload. Changing those bytes would confound the comparison twice
-over, with a different frame length and a destination MAC the generator's port
-might not accept.
+It stamps the TX descriptor on the **original**, which is what puts the driver
+on its shared-page clone path: all n+1 frames are emitted out of the one RX
+page, with no page allocation and no 320-byte memcpy per copy. `xdp-clone`
+allocates and copies. That difference is what this pair measures.
 
-At `copies=0` the app does a **standard `XDP_TX`** and nothing else: no clone
-action, no descriptor, no inline header. That point is the plain-transmission
-reference. The inline header only ever rides on the copies, which is also the
-only place it can: the original of a clone batch cannot carry a descriptor,
-because the driver writes the copy count over it after the program returns.
+By default (`MODE 0`) it stamps **no inline header at all** — just the
+descriptor. Every frame that leaves is byte-identical to what `xdp-clone` would
+have sent: same length, same bytes, same fanout, so the two are directly
+comparable and what shows up in the numbers is the page and the memcpy.
+`MODE 1` pushes a 12-byte header as well, copied from the packet's own first
+bytes; it measures the header on top of the shared page, but the frames leave 12
+bytes longer, so read those rates against `MODE 0` of the same program and not
+against `xdp-clone`.
 
-`xdp-clone` still returns `XDP_CLONE_TX(0)` at that point rather than a plain
-`XDP_TX`, so the two `copies=0` rows are not quite the same code path — they
-differ by the clone bookkeeping for zero copies. Making them identical is a
-two-line change to `apps/xdp-clone`, deliberately not made here because it
-touches the baseline application.
+The rule that comes with the shared page: the program may touch nothing but the
+metadata. `bpf_xdp_adjust_head()` is out, since its memmove of the metadata
+lands on the packet's first bytes and the other emissions share that page — so
+this pushes and cannot replace. That is also why the header cannot be made
+byte-identical *and* keep the frame length, which is what the earlier version of
+this app did with a per-copy page.
+
+**`inline-xdp-clone-tstamp` deliberately stays on the copy path.** The latency
+trick — editing the payload of one copy so that TRex sees one sample per packet
+sent instead of n+1 duplicates — needs a page per copy by construction: on a
+shared page, writing the magic for the last copy would change the frames already
+queued for the earlier ones. So shared mode is measurable on throughput and NDR,
+not on latency, and the latency column measures the inline header on the copy
+path instead.
+
+At `copies=0` both applications return `XDP_CLONE_TX(0)`, so that row is the
+same code path in both: one transmission through the clone machinery with no
+copies.
 
 ## What the flags are for
 

@@ -14,20 +14,38 @@
 #define __XDP_CLONE_TX 6
 #define XDP_CLONE_TX(num_copy) (((int)(num_copy) << 5) | (int)__XDP_CLONE_TX)
 
-/* Throughput / NDR counterpart of ../xdp-clone, with the WQE inline header.
+/* Throughput / NDR counterpart of ../xdp-clone, on the driver's shared-page
+ * clone path.
  *
- * The header is HDR_LEN bytes -- an Ethernet destination + source MAC pair --
- * and it is a *byte-identical copy* of the packet's own MAC pair, with the
- * packet shortened by as much (bpf_xdp_adjust_head). The frame that leaves is
- * therefore exactly the frame ../xdp-clone would have sent, produced through
- * the hardware inline header instead of straight out of the DMA. Same bytes on
- * the wire, same fanout: whatever difference shows up in the numbers is the
- * cost of the mechanism and nothing else.
+ * Stamping the TX descriptor on the *original* is what puts the driver on that
+ * path: it means "my copies differ only in what they write to data_meta", so
+ * all n+1 frames are emitted out of the one RX page — no page allocation and no
+ * 320-byte memcpy per copy. Against ../xdp-clone, which allocates and copies,
+ * that is exactly what this benchmark is here to measure.
  *
- * Changing those bytes would confound the comparison twice over -- a different
- * frame length, and a destination MAC the generator's port may not accept.
+ * The rule that comes with it: touch nothing but the metadata.
+ * bpf_xdp_adjust_head() is out — its memmove of the metadata lands on the
+ * packet's first bytes, and the frames already queued for the other emissions
+ * share that page. So this pushes, it cannot replace.
  */
+
+/* 0 = stamp only, no inline header at all. Every frame that leaves is
+ *     byte-identical to what ../xdp-clone would have sent, same length and
+ *     same fanout, so the two are directly comparable and the difference in
+ *     the numbers is the page and the memcpy. This is the default for a
+ *     reason: it is the only setting that keeps the comparison clean.
+ * 1 = push a HDR_LEN-byte header as well, copied from the packet's own first
+ *     bytes. Measures the header on top of the shared page, but the frames
+ *     leave HDR_LEN bytes longer, so the rates are no longer comparable with
+ *     ../xdp-clone — read them against MODE 0 of this same program instead.
+ */
+#define MODE 0
+
+#if MODE
 #define HDR_LEN 12
+#else
+#define HDR_LEN 0
+#endif
 #define META_NEED (AXDP_TX_DESC_LEN + HDR_LEN)
 
 /* flow_table_metadata tag. Zero: nothing here installs TX flow rules, and a
@@ -37,26 +55,26 @@
 
 __u64 n_clone = 4;
 
-/* Hand the first HDR_LEN bytes of the packet to the NIC as the WQE inline
- * header and drop them from the DMA, so the frame comes out unchanged.
+/* Stamp the descriptor, and with MODE 1 the inline header before it.
  *
- * @cur_meta is how wide the metadata area is on entry: 4 bytes on a copy (the
- * driver put the copy index there), 0 on an original. It is a constant at every
- * call site on purpose -- bpf_xdp_adjust_meta() wants a constant delta to stay
- * out of the verifier's way.
+ * @cur_meta is how wide the metadata area is on entry: nothing on an original,
+ * AXDP_CLONE_META_SIZE on a copy. A constant at both call sites on purpose --
+ * bpf_xdp_adjust_meta() with a variable delta would make the patched verifier
+ * treat the metadata as unknown and refuse the clone action.
  *
- * Returns 0, or -1 if the packet cannot take the header.
+ * Returns 0, or -1 if it does not fit.
  */
-static __always_inline int push_inline_header(struct xdp_md *ctx,
-                                              __u32 cur_meta) {
+static __always_inline int stamp(struct xdp_md *ctx, __u32 cur_meta) {
   void *data = (void *)(long)ctx->data;
+  void *meta;
+#if MODE
   void *data_end = (void *)(long)ctx->data_end;
   __u8 hdr[HDR_LEN];
-  void *meta;
 
   if (data + HDR_LEN > data_end)
     return -1;
   __builtin_memcpy(hdr, data, HDR_LEN);
+#endif
 
   if (bpf_xdp_adjust_meta(ctx, -(int)(META_NEED - cur_meta)))
     return -1;
@@ -67,19 +85,12 @@ static __always_inline int push_inline_header(struct xdp_md *ctx,
   if (meta + META_NEED > data)
     return -1;
 
+#if MODE
   /* The header goes after the descriptor, never on top of it. */
   __builtin_memcpy(meta + AXDP_TX_DESC_LEN, hdr, HDR_LEN);
+#endif
 
-  if (axdp_stamp_tx(ctx, TX_TAG, HDR_LEN))
-    return -1;
-
-  /* Replace rather than push: the NIC prepends the header, and these HDR_LEN
-   * bytes are the ones it stands in for.
-   */
-  if (bpf_xdp_adjust_head(ctx, HDR_LEN))
-    return -1;
-
-  return 0;
+  return axdp_stamp_tx(ctx, TX_TAG, HDR_LEN);
 }
 
 SEC("xdp")
@@ -92,9 +103,9 @@ int inline_xdp_clone(struct xdp_md *ctx) {
   struct udphdr *udph;
   __u32 ip_hdr_len;
 
-  /* A copy carries its index in the four bytes in front of the data. Every
-   * exit of this block is a plain action: the clone action at the bottom has to
-   * stay reachable only from the branch where that metadata is *absent*, or the
+  /* A copy carries its index in the four bytes in front of the data. Every exit
+   * of this block is a plain action: the clone action at the bottom has to stay
+   * reachable only from the branch where that metadata is *absent*, or the
    * patched verifier turns the program down as a nested clone.
    */
   if (data_meta + AXDP_CLONE_META_SIZE <= data) {
@@ -102,7 +113,7 @@ int inline_xdp_clone(struct xdp_md *ctx) {
 
     if (num_copy == 0 || num_copy > n_clone)
       return XDP_DROP;
-    if (push_inline_header(ctx, AXDP_CLONE_META_SIZE))
+    if (stamp(ctx, AXDP_CLONE_META_SIZE))
       return XDP_DROP;
     return XDP_TX;
   }
@@ -129,14 +140,12 @@ int inline_xdp_clone(struct xdp_md *ctx) {
   if ((void *)(udph + 1) > data_end)
     return XDP_DROP;
 
-  /* No copies asked for: a standard XDP_TX and nothing else, so that the
-   * copies=0 point is a plain transmission and the same reference in every
-   * application. No inline header either -- the original of a clone batch
-   * could not carry a descriptor anyway, since the driver writes the copy count
-   * over it after this run, so the header only ever rides on the copies.
+  /* The stamp on the original is the request for the shared-page path. Without
+   * it the driver would give every copy a page and a byte copy of the packet,
+   * which is precisely ../xdp-clone.
    */
-  if (n_clone == 0)
-    return XDP_TX;
+  if (stamp(ctx, 0))
+    return XDP_DROP;
 
   return XDP_CLONE_TX(n_clone);
 }

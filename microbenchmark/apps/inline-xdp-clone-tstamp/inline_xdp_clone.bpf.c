@@ -16,6 +16,19 @@
 
 /* Latency counterpart of ../xdp-clone-tstamp, with the WQE inline header.
  *
+ * This one stays on the copy path -- a page and a byte copy per copy -- and it
+ * cannot be moved to the driver's shared-page mode the way ../inline-xdp-clone
+ * was. The reason is the latency magic below: the whole trick that makes TRex
+ * see one sample per packet sent, instead of n+1 duplicates, is *editing the
+ * payload* of one copy and not the others. On a shared page all the emissions
+ * are the same bytes, so writing 0xab for the last copy would change the frames
+ * already queued for the earlier ones and for the original. A per-copy page is
+ * exactly what this needs.
+ *
+ * So shared mode is measurable on throughput and NDR, not on latency. Moving
+ * the magic into the inline header is not a way out either: it sits at payload
+ * offset 2, far past anything an inline header can reach.
+ *
  * The header is HDR_LEN bytes -- an Ethernet destination + source MAC pair --
  * and it is a *byte-identical copy* of the packet's own MAC pair, with the
  * packet shortened by as much (bpf_xdp_adjust_head). The frame that leaves is
@@ -168,9 +181,6 @@ int inline_xdp_clone(struct xdp_md *ctx) {
    * could not carry a descriptor anyway, since the driver writes the copy count
    * over it after this run, so the header only ever rides on the copies.
    */
-  if (n_clone == 0)
-    return XDP_TX;
-
   return XDP_CLONE_TX(n_clone);
 }
 
