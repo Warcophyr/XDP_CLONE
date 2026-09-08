@@ -1,0 +1,6 @@
+scope,application,configured_copies,tx_cap_mpps,ndr_tx_mpps,ndr_rx_mpps,ndr_input_equiv_mpps,fanout_multiplier,confirm_tx_mpps_mean,confirm_tx_mpps_stddev,confirm_rx_mpps_mean,confirm_rx_mpps_stddev,confirm_input_equiv_mpps_mean,confirm_input_equiv_mpps_stddev,confirm_delivery_ratio_mean,confirm_delivery_ratio_stddev,success_threshold
+per_copies,xdp-clone,0,30.0,10.001144,9.90997825,9.90997825,1.0,10.0055255,0.00848020106262243,9.857249083333334,0.11444407066399703,9.857249083333334,0.11444407066399703,0.9851798990885218,0.01132808917266137,0.99
+per_copies,xdp-clone,1,15.0,,,,2.0,,,,,,,,,0.99
+per_copies,xdp-clone,2,10.0,,,,3.0,,,,,,,,,0.99
+per_copies,xdp-clone,4,6.0,,,,5.0,,,,,,,,,0.99
+per_application,xdp-clone,0,30.0,10.001144,9.90997825,9.90997825,1.0,10.0055255,0.00848020106262243,9.857249083333334,0.11444407066399703,9.857249083333334,0.11444407066399703,0.9851798990885218,0.01132808917266137,0.99
