@@ -23,7 +23,23 @@ TREX_SERVER = "100.78.72.16"
 
 WARMUP_SECONDS = 2
 MEASURE_SECONDS = 4
-SUCCESS_THRESHOLD = 0.99
+# A no-drop rate means no drop: not one of the fanout's frames, original
+# included. So the criterion is a packet count, tx * (copies + 1) - rx, and not
+# a ratio -- a 0.99 ratio threshold was letting one packet in a hundred go
+# missing and still calling the rate an NDR.
+#
+# Zero is the default and the right answer. It is reachable because the probe
+# now stops the traffic and lets the pipeline drain before it reads the final
+# counters (see run_probe): without that, the packets still in the XDP SQ and on
+# the wire at the moment of the read counted as sent but not received, and no
+# rate would ever have measured zero loss. Raise it only if a link turns out to
+# have traffic of its own on it, and read ndr_lost_pkts to see how far from zero
+# a run actually was.
+MAX_LOST_PKTS = 0
+
+# Long enough for the SQ, the wire and TRex's own receive path to empty after
+# the generator stops.
+DRAIN_SECONDS = 1.0
 RX_CAP_MPPS = 30.0
 
 # Rate of the one timestamped stream the profile adds for the latency figures.
@@ -123,34 +139,54 @@ def run_probe(client, configured_copies, requested_tx_mpps, latency=False):
             client.clear_pgid_stats(clear_flow_stats=True, clear_latency_stats=True)
         before = _read_port_counters(client.get_stats(ports=PORTS), port_id=PORTS[0])
         sleep(MEASURE_SECONDS)
-        after = _read_port_counters(client.get_stats(ports=PORTS), port_id=PORTS[0])
         if latency:
             lat = bench.latency_sample(client)
+        # Stop first, then let everything in flight come back, and only then
+        # read. Reading while the generator is still sending counts packets as
+        # transmitted that have not had time to be received yet -- a bias of a
+        # whole pipeline's worth of frames, which is precisely what stops a
+        # zero-loss criterion from ever being met.
+        client.stop(ports=PORTS)
+        sleep(DRAIN_SECONDS)
+        after = _read_port_counters(client.get_stats(ports=PORTS), port_id=PORTS[0])
     finally:
         client.stop(ports=PORTS)
 
     tx_delta = max(0.0, after["tx_pkts"] - before["tx_pkts"])
     rx_delta = max(0.0, after["rx_pkts"] - before["rx_pkts"])
 
+    # Rates over the measurement window: the generator stopped at the end of it,
+    # so tx_delta belongs to exactly MEASURE_SECONDS. rx_delta also covers the
+    # drain, which is the point -- it is every frame that eventually came back.
     measured_tx_mpps = tx_delta / (MEASURE_SECONDS * 1_000_000.0)
     measured_rx_mpps = rx_delta / (MEASURE_SECONDS * 1_000_000.0)
-    # expected_rx = tx * fanout: each sent packet becomes (copies+1) packets at the receiver
+    # expected_rx = tx * fanout: each sent packet becomes (copies+1) packets at
+    # the receiver, the original and its copies.
     expected_rx_mpps = measured_tx_mpps * fanout
     delivered_input_equiv_mpps = measured_rx_mpps / fanout
+
+    # The criterion, in packets. Negative means more came back than the fanout
+    # accounts for, i.e. something else is on the link.
+    lost_pkts = int(round(tx_delta * fanout - rx_delta))
 
     delivery_ratio = 0.0
     if expected_rx_mpps > 0:
         delivery_ratio = measured_rx_mpps / expected_rx_mpps
 
-    success = delivery_ratio >= SUCCESS_THRESHOLD
+    # What the fanout actually was, which is the only thing that can tell "the
+    # device dropped frames" apart from "the device never cloned". Assumed
+    # everywhere else, measured here.
+    measured_fanout = rx_delta / tx_delta if tx_delta > 0 else 0.0
+
+    success = lost_pkts <= MAX_LOST_PKTS
 
     tqdm.write(
         "Measured: "
         f"tx={measured_tx_mpps:.4f} Mpps "
         f"rx={measured_rx_mpps:.4f} Mpps "
         f"expected_rx={expected_rx_mpps:.4f} Mpps "
-        f"ratio={delivery_ratio:.4f} "
-        f"input_eq={delivered_input_equiv_mpps:.4f} Mpps "
+        f"fanout={measured_fanout:.2f}/{fanout:.0f} "
+        f"lost={lost_pkts} "
         f"{'OK' if success else 'LOSS'}"
     )
 
@@ -176,13 +212,15 @@ def run_probe(client, configured_copies, requested_tx_mpps, latency=False):
         "delivered_input_equiv_mpps": delivered_input_equiv_mpps,
         "delivery_ratio": delivery_ratio,
         "fanout_multiplier": fanout,
+        "measured_fanout": measured_fanout,
+        "lost_pkts": lost_pkts,
         "success": success,
         **(lat or {}),
     }
 
 
 def find_ndr(client, configured_copies):
-    """Binary search for the highest TX rate with delivery_ratio >= SUCCESS_THRESHOLD."""
+    """Binary search for the highest TX rate that loses nothing."""
     tx_cap = _tx_cap_mpps(configured_copies)
     search_probes = []
     best_probe = None
@@ -263,6 +301,8 @@ def save_probe_results_csv(results, csv_file=RESULTS_CSV_FILE):
         "expected_rx_mpps",
         "delivered_input_equiv_mpps",
         "fanout_multiplier",
+        "measured_fanout",
+        "lost_pkts",
         "delivery_ratio",
         "success",
         *bench.LATENCY_FIELDS,
@@ -302,6 +342,8 @@ def save_summary_csv(per_copy_summary, csv_file=SUMMARY_CSV_FILE):
         "ndr_tx_mpps_stddev",
         "ndr_rx_mpps",
         "ndr_rx_mpps_stddev",
+        "ndr_fanout",
+        "ndr_lost_pkts",
         *bench.LATENCY_FIELDS,
     ]
 
@@ -325,6 +367,14 @@ def _summarize(app_name, configured_copies, tx_cap, rate_capped, confirm_probes)
         mean, stddev = _mean_std([p[key] for p in confirm_probes])
         row[field] = mean
         row[f"{field}_stddev"] = stddev
+
+    # Not redundant with configured_copies, unlike the fanout_multiplier that
+    # used to sit here: this is the fanout that was *measured*, so a row where
+    # it sits at 1.0 says the device never cloned, and a row where it matches
+    # copies + 1 with ndr_lost_pkts at 0 says every frame of the fanout came
+    # back. Which is the whole claim an NDR makes.
+    row["ndr_fanout"] = _mean_std([p["measured_fanout"] for p in confirm_probes])[0]
+    row["ndr_lost_pkts"] = max(p["lost_pkts"] for p in confirm_probes)
 
     for field in bench.LATENCY_FIELDS:
         values = [p[field] for p in confirm_probes if field in p]
@@ -374,8 +424,11 @@ def main():
 
                     if ndr_rate is None or ndr_probe is None:
                         tqdm.write(
-                            f"No NDR found: no rate met the success threshold "
-                            f"(ratio >= {SUCCESS_THRESHOLD:.2f})."
+                            f"No NDR found: no rate stayed within "
+                            f"{MAX_LOST_PKTS} lost packets. If measured_fanout "
+                            f"in ndr_results.csv is far from "
+                            f"{_fanout_multiplier(configured_copies):.0f}, the "
+                            f"device is not cloning rather than dropping."
                         )
                         per_copy_summary.append({
                             "application": app_name,

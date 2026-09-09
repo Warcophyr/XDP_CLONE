@@ -182,13 +182,43 @@ something else, which is why the preflight is a hard failure:
     columns beside the numbers they summarised. It is now one row per
     (application, copy count) with `application`, `configured_copies`,
     `tx_cap_mpps`, `rate_capped`, `ndr_tx_mpps`, `ndr_rx_mpps` and their
-    standard deviations, plus the latency percentiles.
+    standard deviations, `ndr_fanout`, `ndr_lost_pkts`, and the latency
+    percentiles.
     `fanout_multiplier` and `ndr_input_equiv_mpps` went too: both are functions
     of `configured_copies` alone — fanout is `copies + 1`, input-equivalent is
     `ndr_rx_mpps / fanout` — so nothing is lost. `ndr_tx_mpps` and
     `ndr_rx_mpps` are now the **mean over the confirmation probes** rather than
     the single search probe that found the rate, which is what makes a standard
     deviation next to them mean anything.
+
+11. **The NDR was not a no-drop rate.** `SUCCESS_THRESHOLD = 0.99` accepted one
+    packet in a hundred going missing and still called the rate an NDR, and two
+    things in the measurement made a stricter criterion impossible anyway. The
+    probe read its final counters *while the generator was still sending*, so
+    every frame in the XDP SQ and on the wire counted as transmitted but not
+    received — a whole pipeline's worth of systematic loss. And the criterion
+    was a ratio of rates, which cannot express "not one frame".
+
+    It is now a packet count: `tx * (copies + 1) - rx <= MAX_LOST_PKTS`, with
+    `MAX_LOST_PKTS = 0`, measured after the traffic stops and a
+    `DRAIN_SECONDS = 1.0` pause lets everything in flight come back. The count
+    itself is reported as `ndr_lost_pkts`, so the claim is auditable rather than
+    implied.
+
+    `throughput.py` still uses the 0.99 ratio: it asks a different question —
+    the highest rate at which the device keeps up — and a tolerance there is a
+    choice, not a bug. Do not read its numbers as no-drop rates.
+
+12. **Nothing checked that the cloning happened.** The fanout was assumed
+    everywhere: `expected_rx = tx * (copies + 1)`. A device that silently
+    stopped cloning would return `rx ≈ tx`, fail at every rate, and report "no
+    NDR found" — which is what the empty rows in
+    `results/archive/ndr_summary.csv` look like, and it is indistinguishable
+    from a device that simply cannot keep up. `measured_fanout` (`rx / tx`) is
+    now recorded per probe and averaged into the summary as `ndr_fanout`: at
+    1.0 the device never cloned, at `copies + 1` with `ndr_lost_pkts` at zero
+    every frame of the fanout came back. That pair is the whole claim an NDR
+    makes, and it is now in the table.
 
 ### Flagged — these need a decision, so nothing was changed
 
@@ -229,8 +259,9 @@ something else, which is why the preflight is a hard failure:
    measurement. `rate_capped` now says so, but the real fix is to raise
    `RX_CAP_MPPS` to the receiver's actual capability, or to read those points as
    lower bounds. The archived NDR run shows the neighbouring failure mode too —
-   no rate met the 0.99 threshold at all for `copies >= 1`, so those rows are
-   empty.
+   no rate met the threshold at all for `copies >= 1`, so those rows are empty
+   — and with `ndr_fanout` now in the table, a repeat of that would say whether
+   it was loss or a device that never cloned.
 
 4. **`profiles/zipf-profile.py` hardcodes a destination MAC**
    (`58:a2:e1:d0:69:ce`, which is `enp52s0f0np0`) while the tests run on `$ETH`.
@@ -240,8 +271,8 @@ something else, which is why the preflight is a hard failure:
 
 5. **Trial length.** `WARMUP_SECONDS = 2`, `MEASURE_SECONDS = 4`. RFC 2544 asks
    for 60 s trials; 4 s is fine for a microbenchmark but the numbers carry that
-   caveat, and the `SUCCESS_THRESHOLD = 0.99` decision is taken on ~4 million
-   packets at the low rates.
+   caveat: the zero-loss decision is taken on a single 4 s window, so one
+   stray drop anywhere in it fails the rate.
 
 6. **Traffic runs across the attach/detach of every configuration.** `lat.py`
    starts TRex once and stops it at the very end, so between `stop_program` and
