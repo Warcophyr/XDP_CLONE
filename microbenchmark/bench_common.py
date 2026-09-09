@@ -87,15 +87,16 @@ THROUGHPUT_APPS = {
     #     "base_command": app("tc-clone", "tc_clone"),
     #     "clones": [0, 1, 2, 4, 8, 16, 32, 64],
     # },
-    "inline-xdp-clone": {
-                "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
-                "clones": [0],
-                "inline": True,
-            },
+    
     "xdp-clone": {
             "base_command": app("xdp-clone", "xdp_clone"),
             "clones": [0],
-        },
+    },
+    "inline-xdp-clone": {
+                    "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
+                    "clones": [0],
+                    "inline": True,
+    },
         
 }
 
@@ -296,3 +297,121 @@ def stop_program(process, timeout=5):
             process.kill()
             process.wait()
     tqdm.write("Program terminated.")
+
+
+# ---------------------------------------------------------------------------
+# Latency out of TRex's per-pg_id stats
+# ---------------------------------------------------------------------------
+# One implementation, shared by lat.py and no-drop-throughput.py, because the
+# one they used to carry was wrong in a way that is worth writing down.
+#
+# After clear_pgid_stats(clear_latency_stats=True) the *histogram* TRex hands
+# back is correct: trex_stl_stats.py subtracts the reference bucket by bucket,
+# so it describes exactly the window since the clear. 'total_max' is not. The
+# client zeroes it at the clear and then rebuilds it from 'last_max' -- the max
+# of the server's most recent sampling interval -- and only at the moments
+# get_pgid_stats() is called. Clear, sleep five seconds, read once, and
+# total_max describes the last fraction of a second while the histogram
+# describes all five.
+#
+# That is where percentiles above the maximum came from: the old code passed
+# total_max in as the top of the range and clamped every bucket to it, so a
+# 400 us bucket was reported as a p50 of 400 next to a max of 8. The fix is not
+# to involve total_max at all -- the histogram already carries the range.
+#
+# TRex's buckets are logarithmic and keyed by their lower bound, and the
+# documented meaning of {100: 13} is "13 packets between 100 and 200 usec", so
+# the upper bound of a bucket is the next key that exists in the scale, not the
+# next key present in the dict.
+
+LATENCY_PERCENTILES = (50, 90, 95, 99)
+
+
+def _bucket_upper(lo):
+    """Upper bound of TRex's logarithmic bucket whose lower bound is @lo.
+
+    The scale runs 1..9, 10..90, 100..900, ... so the step at any magnitude is
+    the magnitude itself: bucket 300 ends at 400, bucket 900 at 1000.
+    """
+    step = 10 ** (len(str(int(lo))) - 1)
+    return lo + step
+
+
+def histogram_percentiles(histogram, percentiles=LATENCY_PERCENTILES):
+    """Interpolate @percentiles out of a TRex latency histogram.
+
+    Returns {percentile: usec}, plus the highest populated bucket's upper bound
+    under the key 'max', or None if the histogram is empty.
+    """
+    buckets = sorted(
+        (float(lo), int(count)) for lo, count in histogram.items() if int(count) > 0
+    )
+    if not buckets:
+        return None
+
+    total = sum(count for _, count in buckets)
+    out = {}
+
+    for percentile in percentiles:
+        target = (percentile / 100.0) * total
+        cumulative = 0
+        value = buckets[-1][0]
+
+        for lo, count in buckets:
+            previous = cumulative
+            cumulative += count
+            if cumulative >= target:
+                fraction = (target - previous) / count
+                fraction = min(1.0, max(0.0, fraction))
+                value = lo + fraction * (_bucket_upper(lo) - lo)
+                break
+
+        out[percentile] = value
+
+    out["max"] = _bucket_upper(buckets[-1][0])
+    return out
+
+
+def latency_sample(client, pg_id=1):
+    """min / avg / p50..p99 / max for @pg_id since the last clear, or None.
+
+    'max' is the top of the highest populated bucket rather than TRex's
+    total_max, for the reason above; it is therefore a bucket bound and not an
+    observed value, which is also true of the percentiles.
+    """
+    stats = client.get_pgid_stats([pg_id])
+    section = stats.get("latency") or {}
+    entry = section.get(pg_id, section.get(str(pg_id)))
+    if not entry:
+        return None
+
+    values = entry.get("latency", {})
+    percentiles = histogram_percentiles(values.get("histogram", {}))
+    if percentiles is None:
+        return None
+
+    sample = {
+        "lat_min": float(values.get("total_min", float("nan"))),
+        "lat_avg": float(values.get("average", float("nan"))),
+        "lat_max": percentiles.pop("max"),
+    }
+    for percentile, usec in percentiles.items():
+        sample[f"lat_p{percentile}"] = usec
+
+    err = entry.get("err_cntrs", {}) or {}
+    sample["lat_dup"] = int(err.get("dup", 0))
+    sample["lat_seq_err"] = int(err.get("seq_too_high", 0)) + int(
+        err.get("seq_too_low", 0)
+    )
+    return sample
+
+
+LATENCY_FIELDS = (
+    "lat_min",
+    "lat_avg",
+    "lat_p50",
+    "lat_p90",
+    "lat_p95",
+    "lat_p99",
+    "lat_max",
+)

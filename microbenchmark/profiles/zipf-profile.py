@@ -68,6 +68,11 @@ class ZipfProfile(object):
         self.num_flows = kwargs.get('num_flows', 10000)
         self.skew = kwargs.get('skew', 0.6)
         self.packet_size = kwargs.get('packet_size', 64)
+        # One extra low-rate stream carrying TRex's latency timestamps, so that
+        # a throughput run can report latency as well. 0 leaves it out, which
+        # is what throughput.py wants: it only reads port counters, and an
+        # unused flow_stats stream would just cost the server a rule.
+        self.latency_pps = kwargs.get('latency_pps', 0)
         
         print(f"\n[ZipfProfile PPS] Configurazione:")
         print(f"  • Numero flussi: {self.num_flows:,}")
@@ -121,6 +126,26 @@ class ZipfProfile(object):
             if flow_idx < 10:
                 top_flows_info.append((flow_idx, src_ip, dst_ip, flow_prob))
         
+        if self.latency_pps:
+            # Same shape as the flows above -- same MACs, same size, a UDP port
+            # out of the same range -- so that the program under test treats it
+            # like any other packet. Which means it gets cloned like any other
+            # packet too: at n copies the generator sees n+1 timestamped frames
+            # per one it sent, so the latency distribution is over the whole
+            # fanout, and the dup counter is expected to be large.
+            lat_pkt = (
+                Ether(src="e8:eb:d3:78:95:8d", dst="58:a2:e1:d0:69:ce") /
+                IP(src=src_ips[0], dst=dst_ips[0]) /
+                UDP(sport=int(src_ports[0]), dport=int(dst_ports[0])) /
+                Raw(load=b'\x42' * payload_size)
+            )
+            streams.append(STLStream(
+                packet=STLPktBuilder(pkt=lat_pkt),
+                mode=STLTXCont(pps=self.latency_pps),
+                flow_stats=STLFlowLatencyStats(pg_id=1),
+            ))
+            print(f"  ⏱  Stream latenza: pg_id=1 a {self.latency_pps} pps")
+
         # Statistiche dettagliate (come zipf_profile.py)
         print(f"  ✅ Creati {len(streams):,} stream (PPS mode)")
         print(f"\n  📊 Top 10 flussi (distribuzione Zipf):")

@@ -79,68 +79,6 @@ def _counter_total(counter_values, counter_name):
     return total
 
 
-def _histogram_percentiles(histogram, percentiles, observed_max):
-    bucket_edges = []
-    bucket_counts = {}
-    total_samples = 0
-
-    for latency_usec, samples in histogram.items():
-        edge = float(latency_usec)
-        sample_count = int(samples)
-        bucket_edges.append(edge)
-        bucket_counts[edge] = sample_count
-        if sample_count > 0:
-            total_samples += sample_count
-
-    if total_samples == 0:
-        raise RuntimeError("Latency histogram is empty.")
-
-    bucket_edges.sort()
-    output = {}
-
-    max_latency = float(observed_max)
-    min_latency = bucket_edges[0]
-
-    expanded_buckets = []
-    for idx, lo in enumerate(bucket_edges):
-        count = max(0, int(bucket_counts.get(lo, 0)))
-        next_edge = bucket_edges[idx + 1] if idx + 1 < len(bucket_edges) else max_latency
-        hi = min(next_edge, max_latency)
-        if hi < lo:
-            hi = lo
-        expanded_buckets.append((lo, hi, count))
-
-    for percentile in percentiles:
-        target = (percentile / 100.0) * total_samples
-        cumulative = 0
-        percentile_value = expanded_buckets[-1][0]
-
-        for lo, hi, count in expanded_buckets:
-            previous = cumulative
-            cumulative += count
-
-            if cumulative >= target:
-                if count > 0:
-                    fraction = (target - previous) / count
-                    if fraction < 0.0:
-                        fraction = 0.0
-                    elif fraction > 1.0:
-                        fraction = 1.0
-                    percentile_value = lo + fraction * (hi - lo)
-                else:
-                    percentile_value = lo
-                break
-
-        # if percentile_value < min_latency:
-        #     percentile_value = min_latency
-        # elif percentile_value > max_latency:
-        #     percentile_value = max_latency
-
-        output[percentile] = percentile_value
-
-    return output
-
-
 def latency_stats(client, pg_id=1):
     stats = client.get_pgid_stats([pg_id])
     latency_section = stats.get("latency")
@@ -164,13 +102,18 @@ def latency_stats(client, pg_id=1):
     rx_tx_ratio = int(rx_total / tx_total + 0.5)
     num_copies = rx_tx_ratio - 1
 
-    max_latency = float(latency_values["total_max"])
-    if not histogram:
-        # raise RuntimeError("Latency histogram is empty, cannot compute percentiles.")
+    # Percentiles and the maximum both come out of the histogram, which is the
+    # only part of TRex's latency stats that clear_pgid_stats() really makes
+    # relative to the measurement window -- see bench_common.py. total_max is
+    # rebuilt by the client from the last server sampling interval alone, which
+    # is what used to put percentiles above the maximum in this very CSV.
+    percentiles = bench.histogram_percentiles(histogram)
+    if percentiles is None:
         tqdm.write("⚠️ Latency histogram is empty, percentiles will be set to nan.")
         percentiles = {p: float("nan") for p in [50, 90, 95, 99]}
+        max_latency = float(latency_values["total_max"])
     else:
-        percentiles = _histogram_percentiles(histogram, [50, 90, 95, 99], max_latency)
+        max_latency = percentiles.pop("max")
     result = {
         "min": float(latency_values["total_min"]),
         "avg": float(latency_values["average"]),

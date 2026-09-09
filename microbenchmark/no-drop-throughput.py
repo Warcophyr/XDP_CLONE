@@ -26,6 +26,12 @@ MEASURE_SECONDS = 4
 SUCCESS_THRESHOLD = 0.99
 RX_CAP_MPPS = 30.0
 
+# Rate of the one timestamped stream the profile adds for the latency figures.
+# Small enough to be noise in the offered load (1 kpps against several Mpps),
+# and it is cloned like every other packet, so it does not skew the delivery
+# ratio either -- both sides of it scale with the fanout.
+LATENCY_PPS = 1000
+
 NDR_START_TX_MPPS = 0.25
 NDR_BINARY_STEPS = 8
 NDR_MIN_RATE_STEP_MPPS = 0.02
@@ -90,12 +96,13 @@ def setup_trex():
         PROFILE_FILE,
         direction=0,
         port_id=0,
+        latency_pps=LATENCY_PPS,
     ).get_streams()
     client.add_streams(streams, ports=PORTS)
     return client
 
 
-def run_probe(client, configured_copies, requested_tx_mpps):
+def run_probe(client, configured_copies, requested_tx_mpps, latency=False):
     tx_cap = _tx_cap_mpps(configured_copies)
     requested_tx_mpps = min(requested_tx_mpps, tx_cap)
     fanout = _fanout_multiplier(configured_copies)
@@ -106,12 +113,19 @@ def run_probe(client, configured_copies, requested_tx_mpps):
         f"(tx_cap={tx_cap:.4f}, fanout={fanout:.0f}x, rx_cap={RX_CAP_MPPS:.2f})"
     )
 
+    lat = None
     try:
         client.start(ports=PORTS, force=True, mult=mult)
         sleep(WARMUP_SECONDS)
+        if latency:
+            # After the warmup, so that the latency window is the measurement
+            # window and not the ramp.
+            client.clear_pgid_stats(clear_flow_stats=True, clear_latency_stats=True)
         before = _read_port_counters(client.get_stats(ports=PORTS), port_id=PORTS[0])
         sleep(MEASURE_SECONDS)
         after = _read_port_counters(client.get_stats(ports=PORTS), port_id=PORTS[0])
+        if latency:
+            lat = bench.latency_sample(client)
     finally:
         client.stop(ports=PORTS)
 
@@ -140,6 +154,15 @@ def run_probe(client, configured_copies, requested_tx_mpps):
         f"{'OK' if success else 'LOSS'}"
     )
 
+    if lat:
+        tqdm.write(
+            "Latency (us): "
+            f"min={lat['lat_min']:.1f} avg={lat['lat_avg']:.1f} "
+            f"p50={lat['lat_p50']:.1f} p90={lat['lat_p90']:.1f} "
+            f"p99={lat['lat_p99']:.1f} max={lat['lat_max']:.1f} "
+            f"(dup={lat['lat_dup']} seq_err={lat['lat_seq_err']})"
+        )
+
     return {
         "requested_tx_mpps": requested_tx_mpps,
         "tx_cap_mpps": tx_cap,
@@ -154,6 +177,7 @@ def run_probe(client, configured_copies, requested_tx_mpps):
         "delivery_ratio": delivery_ratio,
         "fanout_multiplier": fanout,
         "success": success,
+        **(lat or {}),
     }
 
 
@@ -219,7 +243,7 @@ def confirm_ndr(client, configured_copies, ndr_rate):
     """Run CONFIRM_REPETITIONS probes at ndr_rate to validate the result."""
     confirm_probes = []
     for repetition in range(1, CONFIRM_REPETITIONS + 1):
-        probe = run_probe(client, configured_copies, ndr_rate)
+        probe = run_probe(client, configured_copies, ndr_rate, latency=True)
         confirm_probes.append({"phase": "confirm", "repetition": repetition, **probe})
     return confirm_probes
 
@@ -241,60 +265,72 @@ def save_probe_results_csv(results, csv_file=RESULTS_CSV_FILE):
         "fanout_multiplier",
         "delivery_ratio",
         "success",
+        *bench.LATENCY_FIELDS,
+        "lat_dup",
+        "lat_seq_err",
     ]
     with open(csv_file, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        # Only the confirm probes carry latency; the search ones leave those
+        # columns empty.
+        writer = csv.DictWriter(file, fieldnames=fieldnames, restval="")
         writer.writeheader()
         writer.writerows(results)
 
 
 def save_summary_csv(per_copy_summary, csv_file=SUMMARY_CSV_FILE):
+    """One row per (application, copy count), and nothing else.
+
+    There used to be a 'scope' column that read per_copies on every row and a
+    trailing per_application row holding whichever copy count happened to score
+    highest -- neither of which said anything the rest of the table did not.
+    Gone, along with fanout_multiplier and ndr_input_equiv_mpps: both are
+    functions of configured_copies alone (fanout = copies + 1, input_equiv =
+    ndr_rx_mpps / fanout), so nothing is lost by leaving them to the reader.
+
+    ndr_tx_mpps and ndr_rx_mpps are the mean over the CONFIRM_REPETITIONS
+    probes taken at the NDR rate, which is what makes a standard deviation
+    meaningful next to them. The latency columns come from the same probes, so
+    they describe the device *at* its no-drop rate rather than under some other
+    load.
+    """
     fieldnames = [
-        "scope",
         "application",
         "configured_copies",
         "tx_cap_mpps",
         "rate_capped",
         "ndr_tx_mpps",
+        "ndr_tx_mpps_stddev",
         "ndr_rx_mpps",
-        "ndr_input_equiv_mpps",
-        "fanout_multiplier",
-        "confirm_tx_mpps_mean",
-        "confirm_tx_mpps_stddev",
-        "confirm_rx_mpps_mean",
-        "confirm_rx_mpps_stddev",
-        "confirm_input_equiv_mpps_mean",
-        "confirm_input_equiv_mpps_stddev",
-        "confirm_delivery_ratio_mean",
-        "confirm_delivery_ratio_stddev",
-        "success_threshold",
+        "ndr_rx_mpps_stddev",
+        *bench.LATENCY_FIELDS,
     ]
 
-    app_max_rows = []
-    by_app = {}
-    for row in per_copy_summary:
-        if row["ndr_input_equiv_mpps"] is None:
-            continue
-        app_name = row["application"]
-        prev = by_app.get(app_name)
-        if prev is None or row["ndr_input_equiv_mpps"] > prev["ndr_input_equiv_mpps"]:
-            by_app[app_name] = row
-
-    for app_name, row in by_app.items():
-        # configured_copies comes *after* the expansion: the dict below used to
-        # put "ALL" first and then let row's own value overwrite it, so every
-        # per_application line was labelled with a copy count instead.
-        app_max_rows.append({"scope": "per_application", "application": app_name,
-                             **{k: row[k] for k in fieldnames[2:]},
-                             "configured_copies": "ALL"})
-
     with open(csv_file, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer = csv.DictWriter(file, fieldnames=fieldnames, restval="")
         writer.writeheader()
-        for row in per_copy_summary:
-            writer.writerow({"scope": "per_copies", **row})
-        for row in app_max_rows:
-            writer.writerow(row)
+        writer.writerows(per_copy_summary)
+
+
+def _summarize(app_name, configured_copies, tx_cap, rate_capped, confirm_probes):
+    """Collapse the confirmation probes into the one summary row."""
+    row = {
+        "application": app_name,
+        "configured_copies": configured_copies,
+        "tx_cap_mpps": tx_cap,
+        "rate_capped": rate_capped,
+    }
+
+    for key, field in (("measured_tx_mpps", "ndr_tx_mpps"),
+                       ("measured_rx_mpps", "ndr_rx_mpps")):
+        mean, stddev = _mean_std([p[key] for p in confirm_probes])
+        row[field] = mean
+        row[f"{field}_stddev"] = stddev
+
+    for field in bench.LATENCY_FIELDS:
+        values = [p[field] for p in confirm_probes if field in p]
+        row[field] = _mean_std(values)[0] if values else None
+
+    return row
 
 
 def main():
@@ -323,7 +359,6 @@ def main():
                     )
 
                 try:
-                    fanout = _fanout_multiplier(configured_copies)
                     tx_cap = _tx_cap_mpps(configured_copies)
 
                     ndr_probe, ndr_rate, search_probes = find_ndr(client, configured_copies)
@@ -346,20 +381,6 @@ def main():
                             "application": app_name,
                             "configured_copies": configured_copies,
                             "tx_cap_mpps": tx_cap,
-                            "rate_capped": None,
-                            "ndr_tx_mpps": None,
-                            "ndr_rx_mpps": None,
-                            "ndr_input_equiv_mpps": None,
-                            "fanout_multiplier": fanout,
-                            "confirm_tx_mpps_mean": None,
-                            "confirm_tx_mpps_stddev": None,
-                            "confirm_rx_mpps_mean": None,
-                            "confirm_rx_mpps_stddev": None,
-                            "confirm_input_equiv_mpps_mean": None,
-                            "confirm_input_equiv_mpps_stddev": None,
-                            "confirm_delivery_ratio_mean": None,
-                            "confirm_delivery_ratio_stddev": None,
-                            "success_threshold": SUCCESS_THRESHOLD,
                         })
                     else:
                         tqdm.write(
@@ -381,40 +402,18 @@ def main():
                             })
                         save_probe_results_csv(probe_rows)
 
-                        tx_vals = [p["measured_tx_mpps"] for p in confirm_probes]
-                        rx_vals = [p["measured_rx_mpps"] for p in confirm_probes]
-                        input_vals = [p["delivered_input_equiv_mpps"] for p in confirm_probes]
-                        ratio_vals = [p["delivery_ratio"] for p in confirm_probes]
+                        per_copy_summary.append(_summarize(
+                            app_name, configured_copies, tx_cap,
+                            ndr_probe["rate_capped"], confirm_probes))
 
-                        tx_mean, tx_std = _mean_std(tx_vals)
-                        rx_mean, rx_std = _mean_std(rx_vals)
-                        input_mean, input_std = _mean_std(input_vals)
-                        ratio_mean, ratio_std = _mean_std(ratio_vals)
-
-                        per_copy_summary.append({
-                            "application": app_name,
-                            "configured_copies": configured_copies,
-                            "tx_cap_mpps": tx_cap,
-                            "rate_capped": ndr_probe["rate_capped"],
-                            "ndr_tx_mpps": ndr_probe["measured_tx_mpps"],
-                            "ndr_rx_mpps": ndr_probe["measured_rx_mpps"],
-                            "ndr_input_equiv_mpps": ndr_probe["delivered_input_equiv_mpps"],
-                            "fanout_multiplier": fanout,
-                            "confirm_tx_mpps_mean": tx_mean,
-                            "confirm_tx_mpps_stddev": tx_std,
-                            "confirm_rx_mpps_mean": rx_mean,
-                            "confirm_rx_mpps_stddev": rx_std,
-                            "confirm_input_equiv_mpps_mean": input_mean,
-                            "confirm_input_equiv_mpps_stddev": input_std,
-                            "confirm_delivery_ratio_mean": ratio_mean,
-                            "confirm_delivery_ratio_stddev": ratio_std,
-                            "success_threshold": SUCCESS_THRESHOLD,
-                        })
+                        row = per_copy_summary[-1]
                         tqdm.write(
-                            f"Confirmation: "
-                            f"rx_mean={rx_mean:.4f} Mpps "
-                            f"input_eq_mean={input_mean:.4f} Mpps "
-                            f"ratio_mean={ratio_mean:.4f}"
+                            "Confirmation: "
+                            f"tx={row['ndr_tx_mpps']:.4f}±{row['ndr_tx_mpps_stddev']:.4f} "
+                            f"rx={row['ndr_rx_mpps']:.4f}±{row['ndr_rx_mpps_stddev']:.4f} Mpps"
+                            + (f" p50={row['lat_p50']:.1f} p99={row['lat_p99']:.1f} us"
+                               if row.get("lat_p50") is not None else
+                               "  (no latency samples)")
                         )
 
                     save_summary_csv(per_copy_summary)

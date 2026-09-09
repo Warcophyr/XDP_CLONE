@@ -44,15 +44,22 @@ directory now; paths are anchored to the scripts themselves.
 |---|---|---|---|
 | `lat.py` | `profiles/clonlat.py` | `get_pgid_stats`: latency counters + histogram, flow_stats rx/tx | yes |
 | `throughput.py` | `profiles/zipf-profile.py` | port counters `opackets`/`ipackets` | no |
-| `no-drop-throughput.py` | `profiles/zipf-profile.py` | port counters `opackets`/`ipackets` | no |
+| `no-drop-throughput.py` | `profiles/zipf-profile.py` + one probe stream | port counters, and `get_pgid_stats` for latency | yes, at the NDR |
 
-The two throughput tests measure **rate only**. Their profile builds plain
-`STLTXCont` streams with no `flow_stats` and no `STLFlowLatencyStats`, and the
-scripts read nothing but the port packet counters, so there is no latency and no
-percentile anywhere in `throughput_*.csv` or `ndr_*.csv`. `STLFlowLatencyStats`
-appears in exactly one place in this tree, `profiles/clonlat.py`, which only
-`lat.py` loads — so the broken percentile code below is confined to `lat.py`
-and cannot have touched the NDR numbers.
+`throughput.py` measures **rate only**: the profile it loads builds plain
+`STLTXCont` streams with no `flow_stats`, and the script reads nothing but the
+port packet counters.
+
+`no-drop-throughput.py` asks the same profile for **one extra timestamped
+stream** (`latency_pps`, 1 kpps, `pg_id=1`) and reads its latency during the
+confirmation probes — so the latency columns describe the device *at* its
+no-drop rate rather than under some other load. The probe looks like the zipf
+traffic, so the program under test treats it like any other packet, which means
+it gets **cloned like any other packet**: at n copies the generator receives n+1
+timestamped frames per one it sent, the latency distribution is over the whole
+fanout, and `lat_dup` in `ndr_results.csv` is expected to be large. At 1 kpps
+against several Mpps the probe is noise in the offered load, and since both
+sides of it scale with the fanout it does not move the delivery ratio either.
 
 ## `inline-xdp-clone`
 
@@ -149,26 +156,43 @@ something else, which is why the preflight is a hard failure:
 8. Three identical copies of `launch_program`/`stop_program`/`set_governor` had
    already drifted apart (only `throughput.py` set the governor). One copy now,
    in `bench_common.py`.
-
-### Flagged — these need a decision, so nothing was changed
-
-1. **The percentile columns in `lat.py` are wrong.** Nine of the seventeen rows
-   in `results/archive/latency_results.csv` have percentiles *above* the
-   maximum, which cannot happen for one consistent set of samples:
+9. **The percentile columns were wrong.** Nine of the seventeen rows in
+   `results/archive/latency_results.csv` have percentiles *above* the maximum,
+   which cannot happen for one consistent set of samples:
 
    ```
    application,configured_copies,repetition,min,avg,max,p50,p90,p95,p99,...
    xdp-clone,0,2,5.0,8.0,8.0,400.0,2000.0,2000.0,2000.0,...
    ```
 
-   `min`/`avg`/`max` come from TRex's counters and `p*` from its histogram, so
-   one of the two is not being reset by
-   `clear_pgid_stats(clear_latency_stats=True)` and the percentiles describe the
-   whole session rather than the 5 s window. `save_latency_summary_csv` then
-   drops `nan`s silently, which hides it. One debug run printing the raw
-   histogram next to `total_min`/`total_max` would settle which side is stale.
+   The histogram was never the problem: `clear_pgid_stats()` does make it
+   relative to the window, bucket by bucket. `total_max` is what lied — the
+   client zeroes it at the clear and then rebuilds it from `last_max`, the
+   server's most recent sampling interval, and only at the moments
+   `get_pgid_stats()` is called. Clear, sleep five seconds, read once, and
+   `total_max` describes the last fraction of a second while the histogram
+   describes all five; the old code passed it in as the top of the range and
+   clamped every bucket to it. Percentiles and the maximum now come out of the
+   histogram alone, in one implementation shared by both scripts
+   (`bench_common.histogram_percentiles()`).
 
-2. **`lat.py` cannot tell whether the cloning happened at all.** The `copies`
+10. **`ndr_summary.csv` was mostly noise.** A `scope` column that read
+    `per_copies` on every row, a trailing `per_application` row holding
+    whichever copy count happened to score highest, and eight `confirm_*`
+    columns beside the numbers they summarised. It is now one row per
+    (application, copy count) with `application`, `configured_copies`,
+    `tx_cap_mpps`, `rate_capped`, `ndr_tx_mpps`, `ndr_rx_mpps` and their
+    standard deviations, plus the latency percentiles.
+    `fanout_multiplier` and `ndr_input_equiv_mpps` went too: both are functions
+    of `configured_copies` alone — fanout is `copies + 1`, input-equivalent is
+    `ndr_rx_mpps / fanout` — so nothing is lost. `ndr_tx_mpps` and
+    `ndr_rx_mpps` are now the **mean over the confirmation probes** rather than
+    the single search probe that found the rate, which is what makes a standard
+    deviation next to them mean anything.
+
+### Flagged — these need a decision, so nothing was changed
+
+1. **`lat.py` cannot tell whether the cloning happened at all.** The `copies`
    column is `rx_pkts/tx_pkts` from TRex's *flow_stats*, and the `-tstamp` apps
    deliberately leave the latency magic on only one copy — so flow_stats sees
    one rx per tx and `copies` reads 0 for every configured count. Every archived
@@ -177,7 +201,7 @@ something else, which is why the preflight is a hard failure:
    look perfectly healthy. A fanout check has to come from elsewhere, e.g. the
    interface's own counters via `ethtool -S $ETH`.
 
-3. **The baseline apps probably will not load on the patched kernel.**
+2. **The baseline apps probably will not load on the patched kernel.**
    `apps/xdp-clone` and `apps/xdp-clone-tstamp` have a metadata-check block that
    can fall through to the clone action:
 
@@ -199,7 +223,7 @@ something else, which is why the preflight is a hard failure:
    nested clone the driver would abort anyway. Left alone because it touches the
    baseline; the `inline-*` apps are written so the block always returns.
 
-4. **The throughput search saturates at high copy counts.** With
+3. **The throughput search saturates at high copy counts.** With
    `RX_CAP_MPPS = 30` and `START_TX_MPPS = 0.25`, `copies=64` gives a search
    range of 0.25 → 0.46 Mpps, so the reported maximum is the cap and not a
    measurement. `rate_capped` now says so, but the real fix is to raise
@@ -208,23 +232,23 @@ something else, which is why the preflight is a hard failure:
    no rate met the 0.99 threshold at all for `copies >= 1`, so those rows are
    empty.
 
-5. **`profiles/zipf-profile.py` hardcodes a destination MAC**
+4. **`profiles/zipf-profile.py` hardcodes a destination MAC**
    (`58:a2:e1:d0:69:ce`, which is `enp52s0f0np0`) while the tests run on `$ETH`.
    It works only because `enp52s0f1np1` happens to be in `PROMISC`. Take the
    interface out of promiscuous mode and the throughput goes to zero with no
    explanation. The profile should take the MAC as a tunable.
 
-6. **Trial length.** `WARMUP_SECONDS = 2`, `MEASURE_SECONDS = 4`. RFC 2544 asks
+5. **Trial length.** `WARMUP_SECONDS = 2`, `MEASURE_SECONDS = 4`. RFC 2544 asks
    for 60 s trials; 4 s is fine for a microbenchmark but the numbers carry that
    caveat, and the `SUCCESS_THRESHOLD = 0.99` decision is taken on ~4 million
    packets at the low rates.
 
-7. **Traffic runs across the attach/detach of every configuration.** `lat.py`
+6. **Traffic runs across the attach/detach of every configuration.** `lat.py`
    starts TRex once and stops it at the very end, so between `stop_program` and
    the next `launch_program` there is no XDP program and the packets go up the
    stack. The 2 s sleep before `clear_pgid_stats` covers it, but only by
    accident of timing.
 
-8. **The five latency repetitions share one program instance**, so they repeat
+7. **The five latency repetitions share one program instance**, so they repeat
    the measurement and not the setup: they say nothing about run-to-run variance
    in attaching the program or in the page-pool state.
