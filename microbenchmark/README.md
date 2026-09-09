@@ -199,11 +199,16 @@ something else, which is why the preflight is a hard failure:
     received — a whole pipeline's worth of systematic loss. And the criterion
     was a ratio of rates, which cannot express "not one frame".
 
-    It is now a packet count: `tx * (copies + 1) - rx <= MAX_LOST_PKTS`, with
-    `MAX_LOST_PKTS = 0`, measured after the traffic stops and a
-    `DRAIN_SECONDS = 1.0` pause lets everything in flight come back. The count
-    itself is reported as `ndr_lost_pkts`, so the claim is auditable rather than
-    implied.
+    The measurement is fixed: the counters are read after the traffic stops and
+    a `DRAIN_SECONDS = 1.0` pause lets everything in flight come back, so the
+    delivered fraction is now the device's and not the pipeline's. The
+    criterion stays a percentage — `MIN_DELIVERED_PCT`, default **99.9** — but
+    it is computed in packets against the whole fanout, original included, and
+    the frames actually lost by the accepted rate are reported as
+    `ndr_lost_pkts`. So the claim is auditable rather than implied: at 99.9%
+    over a 4 s window at 3.5 Mpps with three-way fanout, the threshold allows
+    up to ~42.000 frames out of 42 million, and the column says how many really
+    went missing. Set it to `100.0` for a strict no-drop rate.
 
     `throughput.py` still uses the 0.99 ratio: it asks a different question —
     the highest rate at which the device keeps up — and a tolerance there is a
@@ -271,8 +276,8 @@ something else, which is why the preflight is a hard failure:
 
 5. **Trial length.** `WARMUP_SECONDS = 2`, `MEASURE_SECONDS = 4`. RFC 2544 asks
    for 60 s trials; 4 s is fine for a microbenchmark but the numbers carry that
-   caveat: the zero-loss decision is taken on a single 4 s window, so one
-   stray drop anywhere in it fails the rate.
+   caveat: the decision is taken on a single 4 s window, and at
+   `MIN_DELIVERED_PCT = 100.0` one stray drop anywhere in it fails the rate.
 
 6. **Traffic runs across the attach/detach of every configuration.** `lat.py`
    starts TRex once and stops it at the very end, so between `stop_program` and

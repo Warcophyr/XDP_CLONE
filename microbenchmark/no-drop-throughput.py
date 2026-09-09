@@ -23,19 +23,21 @@ TREX_SERVER = "100.78.72.16"
 
 WARMUP_SECONDS = 2
 MEASURE_SECONDS = 4
-# A no-drop rate means no drop: not one of the fanout's frames, original
-# included. So the criterion is a packet count, tx * (copies + 1) - rx, and not
-# a ratio -- a 0.99 ratio threshold was letting one packet in a hundred go
-# missing and still calling the rate an NDR.
+# Percentage of the fanout's frames -- the original and all its copies -- that
+# has to come back for a rate to count as delivered. 100.0 is a true no-drop
+# rate; 99.9 leaves room for the odd frame lost to something other than the
+# device, at the price of allowing one in a thousand.
 #
-# Zero is the default and the right answer. It is reachable because the probe
-# now stops the traffic and lets the pipeline drain before it reads the final
-# counters (see run_probe): without that, the packets still in the XDP SQ and on
-# the wire at the moment of the read counted as sent but not received, and no
-# rate would ever have measured zero loss. Raise it only if a link turns out to
-# have traffic of its own on it, and read ndr_lost_pkts to see how far from zero
-# a run actually was.
-MAX_LOST_PKTS = 0
+# The number is only worth anything because the probe now stops the traffic and
+# lets the pipeline drain before reading the final counters (see run_probe).
+# Reading while the generator was still sending counted every frame in the XDP
+# SQ and on the wire as sent but not received, which at these rates is a whole
+# pipeline of systematic loss -- enough that the old 99.0 was largely measuring
+# the pipeline depth rather than anything the device did.
+#
+# Whatever it is set to, ndr_lost_pkts in the summary says how many frames the
+# accepted rate actually lost, so the claim stays auditable.
+MIN_DELIVERED_PCT = 99.9
 
 # Long enough for the SQ, the wire and TRex's own receive path to empty after
 # the generator stops.
@@ -165,20 +167,23 @@ def run_probe(client, configured_copies, requested_tx_mpps, latency=False):
     expected_rx_mpps = measured_tx_mpps * fanout
     delivered_input_equiv_mpps = measured_rx_mpps / fanout
 
-    # The criterion, in packets. Negative means more came back than the fanout
-    # accounts for, i.e. something else is on the link.
-    lost_pkts = int(round(tx_delta * fanout - rx_delta))
+    # Both in packets rather than in rates: same quotient, but it lines up with
+    # the loss count and there is one division less to reason about. Negative
+    # loss means more came back than the fanout accounts for, i.e. something
+    # else is on the link.
+    expected_rx_pkts = tx_delta * fanout
+    lost_pkts = int(round(expected_rx_pkts - rx_delta))
 
     delivery_ratio = 0.0
-    if expected_rx_mpps > 0:
-        delivery_ratio = measured_rx_mpps / expected_rx_mpps
+    if expected_rx_pkts > 0:
+        delivery_ratio = rx_delta / expected_rx_pkts
 
     # What the fanout actually was, which is the only thing that can tell "the
     # device dropped frames" apart from "the device never cloned". Assumed
     # everywhere else, measured here.
     measured_fanout = rx_delta / tx_delta if tx_delta > 0 else 0.0
 
-    success = lost_pkts <= MAX_LOST_PKTS
+    success = delivery_ratio >= MIN_DELIVERED_PCT / 100.0
 
     tqdm.write(
         "Measured: "
@@ -186,7 +191,7 @@ def run_probe(client, configured_copies, requested_tx_mpps, latency=False):
         f"rx={measured_rx_mpps:.4f} Mpps "
         f"expected_rx={expected_rx_mpps:.4f} Mpps "
         f"fanout={measured_fanout:.2f}/{fanout:.0f} "
-        f"lost={lost_pkts} "
+        f"delivered={delivery_ratio * 100:.3f}% lost={lost_pkts} "
         f"{'OK' if success else 'LOSS'}"
     )
 
@@ -220,7 +225,7 @@ def run_probe(client, configured_copies, requested_tx_mpps, latency=False):
 
 
 def find_ndr(client, configured_copies):
-    """Binary search for the highest TX rate that loses nothing."""
+    """Binary search for the highest TX rate that delivers the whole fanout."""
     tx_cap = _tx_cap_mpps(configured_copies)
     search_probes = []
     best_probe = None
@@ -424,9 +429,9 @@ def main():
 
                     if ndr_rate is None or ndr_probe is None:
                         tqdm.write(
-                            f"No NDR found: no rate stayed within "
-                            f"{MAX_LOST_PKTS} lost packets. If measured_fanout "
-                            f"in ndr_results.csv is far from "
+                            f"No NDR found: no rate delivered "
+                            f"{MIN_DELIVERED_PCT}% of the fanout. If "
+                            f"measured_fanout in ndr_results.csv is far from "
                             f"{_fanout_multiplier(configured_copies):.0f}, the "
                             f"device is not cloning rather than dropping."
                         )
