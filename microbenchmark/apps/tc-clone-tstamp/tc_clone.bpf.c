@@ -56,14 +56,21 @@ int tc_clone(struct __sk_buff *skb) {
   if (bpf_ntohs(udp->dest) != UDP_PORT_LOAD)
     return TC_ACT_SHOT;
 
+  /* Read the ifindex before the first bpf_clone_redirect(): that helper can
+   * reallocate the skb, after which the verifier refuses to dereference the
+   * context pointer again ("dereference of modified ctx ptr"). Nothing below
+   * touches the packet, so this is the only thing we need to carry across.
+   */
+  __u32 ifindex = skb->ifindex;
+
 #define MAX_CLONE 512
 #pragma unroll
   for (int i = 0; i < MAX_CLONE; i++) {
     if (i >= n_clone)
       break;
 
-    bpf_clone_redirect(skb, skb->ifindex, 0);
+    bpf_clone_redirect(skb, ifindex, 0);
   }
 
-  return bpf_redirect(skb->ifindex, 0);
+  return bpf_redirect(ifindex, 0);
 }
