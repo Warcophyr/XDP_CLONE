@@ -74,29 +74,29 @@ LATENCY_APPS = {
 }
 
 THROUGHPUT_APPS = {
-    # "xdp-clone": {
-    #     "base_command": app("xdp-clone", "xdp_clone"),
-    #     "clones": [0, 1, 2, 4, 8, 16, 32, 64],
-    # },
-    # "inline-xdp-clone": {
-    #     "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
-    #     "clones": [0, 1, 2, 4, 8, 16, 32, 64],
-    #     "inline": True,
-    # },
-    # "tc-clone": {
-    #     "base_command": app("tc-clone", "tc_clone"),
-    #     "clones": [0, 1, 2, 4, 8, 16, 32, 64],
-    # },
-    
     "xdp-clone": {
-            "base_command": app("xdp-clone", "xdp_clone"),
-            "clones": [0],
+        "base_command": app("xdp-clone", "xdp_clone"),
+        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
     },
     "inline-xdp-clone": {
-                    "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
-                    "clones": [0],
-                    "inline": True,
+        "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
+        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
+        "inline": True,
     },
+    "tc-clone": {
+        "base_command": app("tc-clone", "tc_clone"),
+        "clones": [0, 1, 2, 4, 8, 16, 32, 64],
+    },
+    
+    # "xdp-clone": {
+    #         "base_command": app("xdp-clone", "xdp_clone"),
+    #         "clones": [0],
+    # },
+    # "inline-xdp-clone": {
+    #                 "base_command": app("inline-xdp-clone", "inline_xdp_clone"),
+    #                 "clones": [0],
+    #                 "inline": True,
+    # },
         
 }
 
@@ -332,7 +332,15 @@ def _bucket_upper(lo):
 
     The scale runs 1..9, 10..90, 100..900, ... so the step at any magnitude is
     the magnitude itself: bucket 300 ends at 400, bucket 900 at 1000.
+
+    Bucket 0 is the exception: the formula would make it one microsecond wide,
+    when in the histograms TRex actually returns it is the whole [0, 10) decade
+    -- 0 and 10 are adjacent keys with nothing between them. Getting this wrong
+    put p50 at 0.5 us for every run whose latency sat in that first bucket,
+    which is how the summary ended up reporting a median below its own minimum.
     """
+    if lo <= 0:
+        return 10.0
     step = 10 ** (len(str(int(lo))) - 1)
     return lo + step
 
