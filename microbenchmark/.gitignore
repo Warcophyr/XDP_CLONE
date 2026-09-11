@@ -4,3 +4,4 @@ __pycache__/
 # conflict; results/archive/ holds the CSVs from before the move and is kept on
 # disk, not in git.
 results/
+.claude/
