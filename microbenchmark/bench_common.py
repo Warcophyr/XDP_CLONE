@@ -58,13 +58,23 @@ def app(directory, binary):
 # See README.md.
 # ---------------------------------------------------------------------------
 # Latency is measured on a probe stream that is never cloned, while the fan-out
-# load runs beside it (profiles/clonlat.py). The load is a *publish* rate, so
-# the frames the machine actually emits are LATENCY_LOAD_PPS * (copies + 1):
-# 100k publishes is 200k frames at one copy and 6.5M at 64, which is why the
-# curve bends at high copy counts -- that bend is the result, not an artefact.
-# Set LATENCY_LOAD_PPS = 0 to measure an idle machine, where the curve comes
-# out flat across every copy count.
-LATENCY_LOAD_PPS = 100_000
+# load runs beside it (profiles/clonlat.py).
+#
+# This is a *publish* rate, so the frames the machine emits are
+# LATENCY_LOAD_PPS * (copies + 1) and the offered load grows 65-fold across the
+# sweep. The rate therefore has to be low enough that even the last point stays
+# inside the weakest application's no-drop rate, or that point measures a
+# saturated machine rather than its latency: at 100k publishes the fan-out came
+# out as 40, 36 and 1 copies instead of 64, with milliseconds of queueing.
+#
+# The binding case is tc-clone at 64 copies, whose measured NDR is 16k
+# publishes/s (results/ndr_summary.csv). 10k leaves every application inside its
+# own no-drop rate at every copy count -- tc at 64 copies, the tightest, sits at
+# about 63% of it. The price is that the low end of the sweep is nearly idle:
+# 10k frames/s at copies=0 against 12 Mpps of capacity.
+#
+# Set LATENCY_LOAD_PPS = 0 to drop the load stream entirely.
+LATENCY_LOAD_PPS = 10_000
 LATENCY_PROBE_PPS = 1_000
 
 LATENCY_APPS = {
