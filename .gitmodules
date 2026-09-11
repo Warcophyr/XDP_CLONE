@@ -7,3 +7,7 @@
 [submodule "XuDP"]
 	path = XuDP
 	url = https://github.com/Warcophyr/XDP-MPI-Collectives.git
+[submodule "electrode"]
+	path = electrode
+	url = https://github.com/VladimiroPaschali/Electrode.git
+	branch = xdp-clone
