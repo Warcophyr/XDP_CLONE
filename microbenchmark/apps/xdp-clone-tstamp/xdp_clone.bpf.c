@@ -27,6 +27,10 @@
   (((int)(num_copy) << 5) | (int)__XDP_CLONE_PASS)
 #define XDP_CLONE_TX(num_copy) (((int)(num_copy) << 5) | (int)__XDP_CLONE_TX)
 
+/* Load stream, cloned; probe stream, bounced untouched. */
+#define UDP_PORT_LOAD 8901
+#define UDP_PORT_PROBE 8902
+
 __u64 n_clone = 4;
 
 SEC("xdp")
@@ -64,17 +68,18 @@ int xdp_clone(struct xdp_md *ctx) {
     bpf_printk("XDP: UDP header validation failed\n");
     return XDP_DROP;
   }
-  if (bpf_ntohs(udph->dest) != 8901) {
-    return XDP_DROP;
-  }
-  void *payload = (void *)udph + sizeof(struct udphdr);
+  /* The probe stream: bounced straight back, never cloned, payload untouched,
+   * so the generator times one frame per packet it sent. Latency measured on
+   * the cloned stream instead is dominated by how the burst of n+1 frames is
+   * absorbed downstream -- it steps by ~30us at three copies and then stops
+   * growing, on every one of these applications, which is an artefact of the
+   * instrument and not of the datapath.
+   */
+  if (bpf_ntohs(udph->dest) == UDP_PORT_PROBE)
+    return XDP_TX;
 
-  if (payload + 18 <= data_end) {
-    unsigned char *p = payload;
-    // rimuove magic number latency
-    if (n_clone != 0) {
-      p[2] = 0x00;
-    }
+  if (bpf_ntohs(udph->dest) != UDP_PORT_LOAD) {
+    return XDP_DROP;
   }
 
   if (ctx->data_meta + sizeof(__u32) <= ctx->data) {
@@ -82,21 +87,12 @@ int xdp_clone(struct xdp_md *ctx) {
     num_copy = *(__u32 *)data_meta;
 
     /* Consider valid metadata only for actual clone copies. */
-    if (num_copy > 0 && num_copy < n_clone) {
-      // bpf_printk("copia num_copy: %u\n", num_copy);
+    if (num_copy > 0 && num_copy <= n_clone)
       return XDP_TX;
-    }
-    if (num_copy == n_clone) {
-      if (payload + 18 <= data_end) {
-        unsigned char *p = payload;
-        // riscrive magic number latency
-        p[2] = 0xab;
-      }
-      return XDP_TX;
-    }
+
     bpf_printk("errore num_copy: %u\n", num_copy);
   }
-  
+
 
   /* No copies asked for: a plain XDP_TX, not XDP_CLONE_TX(0). It is the same
    * one frame out either way, but the clone action costs the copy-count write

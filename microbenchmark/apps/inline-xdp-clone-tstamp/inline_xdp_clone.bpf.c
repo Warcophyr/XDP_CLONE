@@ -48,19 +48,18 @@
  */
 #define TX_TAG 0
 
-/* The latency profile (profiles/clonlat.py) sends to this port only. */
-#define UDP_PORT 8901
-
-/* Offset of TRex's latency magic inside the UDP payload, and the byte it
- * expects there. Cloning a latency packet would hand the generator n+1 samples
- * carrying the same sequence number, which it counts as duplicates rather than
- * as latency, so the magic is stripped from the original and put back on
- * exactly one of the copies -- the last one. Same trick as
- * ../xdp-clone-tstamp, and the reason that app exists next to ../xdp-clone.
+/* The load stream, which gets cloned, and the probe stream, which is bounced
+ * back untouched so the generator times one frame per packet it sent. Latency
+ * measured on the cloned stream is dominated by how the burst of n+1 frames is
+ * absorbed downstream -- see ../xdp-clone-tstamp.
+ *
+ * Doing it this way also takes a write to the packet off the copy path, which
+ * this program was not entitled to make: all the copies of a stamped batch
+ * share one page (see the header comment), so editing the payload on one copy
+ * changed the frames already queued for the others.
  */
-#define TSTAMP_MAGIC_OFF 2
-#define TSTAMP_MAGIC 0xab
-#define TSTAMP_MIN_PAYLOAD 18
+#define UDP_PORT_LOAD 8901
+#define UDP_PORT_PROBE 8902
 
 __u64 n_clone = 4;
 
@@ -117,12 +116,8 @@ int inline_xdp_clone(struct xdp_md *ctx) {
   struct ethhdr *eth;
   struct iphdr *iph;
   struct udphdr *udph;
-  unsigned char *payload;
   __u32 ip_hdr_len;
 
-  /* Parsed up front, unlike ../inline-xdp-clone: both branches below need the
-   * payload to get at the latency magic.
-   */
   eth = data;
   if ((void *)(eth + 1) > data_end)
     return XDP_DROP;
@@ -142,10 +137,11 @@ int inline_xdp_clone(struct xdp_md *ctx) {
   if ((void *)(udph + 1) > data_end)
     return XDP_DROP;
 
-  if (bpf_ntohs(udph->dest) != UDP_PORT)
-    return XDP_DROP;
+  if (bpf_ntohs(udph->dest) == UDP_PORT_PROBE)
+    return XDP_TX;
 
-  payload = (void *)udph + sizeof(struct udphdr);
+  if (bpf_ntohs(udph->dest) != UDP_PORT_LOAD)
+    return XDP_DROP;
 
   /* A copy carries its index in the four bytes in front of the data. Every exit
    * of this block is a plain action: the clone action at the bottom has to stay
@@ -158,22 +154,10 @@ int inline_xdp_clone(struct xdp_md *ctx) {
     if (num_copy == 0 || num_copy > n_clone)
       return XDP_DROP;
 
-    /* The last copy is the one the generator gets to time. */
-    if (num_copy == n_clone &&
-        (void *)(payload + TSTAMP_MIN_PAYLOAD) <= data_end)
-      payload[TSTAMP_MAGIC_OFF] = TSTAMP_MAGIC;
-
     if (push_inline_header(ctx, AXDP_CLONE_META_SIZE))
       return XDP_DROP;
     return XDP_TX;
   }
-
-  /* Original packet: strip the magic, so that only the copy above carries it.
-   * The copies are taken from this buffer after the run, so the write lands in
-   * all of them.
-   */
-  if (n_clone != 0 && (void *)(payload + TSTAMP_MIN_PAYLOAD) <= data_end)
-    payload[TSTAMP_MAGIC_OFF] = 0x00;
 
   /* No copies asked for: a plain XDP_TX, not XDP_CLONE_TX(0). It is the same
    * one frame out either way, but the clone action costs the copy-count write

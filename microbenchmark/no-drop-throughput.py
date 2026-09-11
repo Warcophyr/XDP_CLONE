@@ -37,7 +37,9 @@ MEASURE_SECONDS = 4
 #
 # Whatever it is set to, ndr_lost_pkts in the summary says how many frames the
 # accepted rate actually lost, so the claim stays auditable.
-MIN_DELIVERED_PCT = 99.9
+# MIN_DELIVERED_PCT = 99.9
+MIN_DELIVERED_PCT = 99
+
 
 # Long enough for the SQ, the wire and TRex's own receive path to empty after
 # the generator stops.

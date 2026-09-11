@@ -38,11 +38,44 @@ The scripts check those two private flags before they start and refuse to run
 otherwise — see "What the flags are for" below. They can be run from any
 directory now; paths are anchored to the scripts themselves.
 
+## How latency is measured
+
+The probe and the load are **separate streams on separate ports**. `profiles/
+clonlat.py` sends an uncloned probe to UDP 8902 at `LATENCY_PROBE_PPS` with the
+latency histogram on `pg_id=1`, and the fan-out load to UDP 8901 at
+`LATENCY_LOAD_PPS` with plain counters on `pg_id=2`; the `-tstamp` apps bounce
+8902 straight back, untouched, and clone 8901. So the histogram holds one sample
+per packet sent, of a frame that travelled alone, while the machine is busy
+fanning out the load. `copies` in the CSV comes from the load stream's rx/tx
+ratio and should equal the configured count.
+
+It used to be one stream doing both jobs: the app stripped TRex's latency magic
+from every frame and put it back on exactly one copy, so that the generator got
+one sample per packet instead of n+1 duplicates. What that measured was not the
+machine. The reported latency stepped from ~9 to ~43 microseconds between two
+and three copies and then stopped growing — 43, 43, 45 at 3, 4, 8 copies —
+identically for the XDP, the inline and the TC application. Three measurements
+place the cost outside the datapath:
+
+* moving the magic from the last copy to the **first** changes nothing (11, 11,
+  43, 42, 43 µs at 1, 2, 3, 4, 8 copies), so it is not the time to finish the
+  fan-out;
+* letting the driver produce every copy but putting only **one** frame on the
+  wire removes the step entirely (9, 10, 11, 12, 14 µs at 1..8 copies, with
+  `rx_xdp_drop` counting the copies that were produced and dropped), so it is
+  not the cost of cloning;
+* the step is there at **100 packets per second**, one packet every 10 ms, and
+  gone at 50 kpps — the slower case is the emptier one, which rules out
+  congestion anywhere.
+
+With the probe separated, the curve is flat across every copy count on an idle
+machine and rises monotonically under load, which is what it should do.
+
 ## What each test measures
 
 | script | profile | what TRex reports | latency? |
 |---|---|---|---|
-| `lat.py` | `profiles/clonlat.py` | `get_pgid_stats`: latency counters + histogram, flow_stats rx/tx | yes |
+| `lat.py` | `profiles/clonlat.py` | `get_pgid_stats`: latency histogram of the uncloned probe (pg_id 1), flow_stats rx/tx of the cloned load (pg_id 2) | yes, under fan-out load |
 | `throughput.py` | `profiles/zipf-profile.py` | port counters `opackets`/`ipackets` | no |
 | `no-drop-throughput.py` | `profiles/zipf-profile.py` + one probe stream | port counters, and `get_pgid_stats` for latency | yes, at the NDR |
 
@@ -89,13 +122,15 @@ this pushes and cannot replace. That is also why the header cannot be made
 byte-identical *and* keep the frame length, which is what the earlier version of
 this app did with a per-copy page.
 
-**`inline-xdp-clone-tstamp` deliberately stays on the copy path.** The latency
-trick — editing the payload of one copy so that TRex sees one sample per packet
-sent instead of n+1 duplicates — needs a page per copy by construction: on a
-shared page, writing the magic for the last copy would change the frames already
-queued for the earlier ones. So shared mode is measurable on throughput and NDR,
-not on latency, and the latency column measures the inline header on the copy
-path instead.
+**`inline-xdp-clone-tstamp` stays on the copy path** — for now only out of
+inertia. It used to have no choice: the latency trick it carried, editing the
+payload of one copy so that TRex saw one sample per packet instead of n+1
+duplicates, needed a page per copy, because on a shared page writing the magic
+for the last copy changes the frames already queued for the earlier ones. That
+write is gone (see *How latency is measured* above), so nothing stops this app
+from stamping the original and being measured on the shared page like the
+throughput one. Switching it would make the latency and throughput columns
+describe the same datapath, and is the obvious next step here.
 
 At `copies=0` every application here returns a plain `XDP_TX` rather than
 `XDP_CLONE_TX(0)`. It is the same one frame out either way, but the clone action
@@ -227,14 +262,12 @@ something else, which is why the preflight is a hard failure:
 
 ### Flagged — these need a decision, so nothing was changed
 
-1. **`lat.py` cannot tell whether the cloning happened at all.** The `copies`
-   column is `rx_pkts/tx_pkts` from TRex's *flow_stats*, and the `-tstamp` apps
-   deliberately leave the latency magic on only one copy — so flow_stats sees
-   one rx per tx and `copies` reads 0 for every configured count. Every archived
-   row confirms it: `rx_tx_ratio=1, copies=0` at `configured_copies` 0, 1, 2 and
-   4 alike. If the driver silently stopped cloning, the latency numbers would
-   look perfectly healthy. A fanout check has to come from elsewhere, e.g. the
-   interface's own counters via `ethtool -S $ETH`.
+1. ~~**`lat.py` cannot tell whether the cloning happened at all.**~~ Fixed: the
+   fan-out is now read from the *load* stream's own pg_id, which is the one that
+   gets cloned, so `copies` reports 1, 2, 4 … and a driver that silently stopped
+   cloning shows up as a zero. The old rows all read `rx_tx_ratio=1, copies=0`
+   whatever the configured count, because the probe and the load were the same
+   stream.
 
 2. **The baseline apps probably will not load on the patched kernel.**
    `apps/xdp-clone` and `apps/xdp-clone-tstamp` have a metadata-check block that

@@ -57,6 +57,16 @@ def app(directory, binary):
 # and stays on the copy path, measuring the inline header rather than the page.
 # See README.md.
 # ---------------------------------------------------------------------------
+# Latency is measured on a probe stream that is never cloned, while the fan-out
+# load runs beside it (profiles/clonlat.py). The load is a *publish* rate, so
+# the frames the machine actually emits are LATENCY_LOAD_PPS * (copies + 1):
+# 100k publishes is 200k frames at one copy and 6.5M at 64, which is why the
+# curve bends at high copy counts -- that bend is the result, not an artefact.
+# Set LATENCY_LOAD_PPS = 0 to measure an idle machine, where the curve comes
+# out flat across every copy count.
+LATENCY_LOAD_PPS = 100_000
+LATENCY_PROBE_PPS = 1_000
+
 LATENCY_APPS = {
     "xdp-clone": {
         "base_command": app("xdp-clone-tstamp", "xdp_clone"),

@@ -11,6 +11,10 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
+/* Load stream, cloned; probe stream, bounced untouched. */
+#define UDP_PORT_LOAD 8901
+#define UDP_PORT_PROBE 8902
+
 __u64 n_clone = 4;
 
 
@@ -42,14 +46,15 @@ int tc_clone(struct __sk_buff *skb) {
   struct udphdr *udp = ip_end;
   if ((void *)(udp + 1) > data_end)
     return TC_ACT_SHOT;
-  if (bpf_ntohs(udp->dest) != 8901)
-    return TC_ACT_SHOT;
+  /* The probe stream: bounced straight back, never cloned, payload untouched.
+   * See ../xdp-clone-tstamp for why latency is not measured on the cloned
+   * stream.
+   */
+  if (bpf_ntohs(udp->dest) == UDP_PORT_PROBE)
+    return bpf_redirect(skb->ifindex, 0);
 
-  void *payload = (void *)udp + sizeof(struct udphdr);
-  if (payload + 18 > data_end)
+  if (bpf_ntohs(udp->dest) != UDP_PORT_LOAD)
     return TC_ACT_SHOT;
-  unsigned char *p = payload;
-  p[2] = 0x00;
 
 #define MAX_CLONE 512
 #pragma unroll
@@ -59,32 +64,6 @@ int tc_clone(struct __sk_buff *skb) {
 
     bpf_clone_redirect(skb, skb->ifindex, 0);
   }
-
-  data = (void *)(long)skb->data;
-  data_end = (void *)(long)skb->data_end;
-
-  eth = data;
-  if ((void *)(eth + 1) > data_end)
-    return TC_ACT_SHOT;
-
-  ip = data + sizeof(*eth);
-  if ((void *)(ip + 1) > data_end)
-    return TC_ACT_SHOT;
-
-  ip_end = (void *)ip + ip->ihl * 4;
-  if (ip_end > data_end)
-    return TC_ACT_SHOT;
-
-  udp = ip_end;
-  if ((void *)(udp + 1) > data_end)
-    return TC_ACT_SHOT;
-
-  payload = (void *)udp + sizeof(struct udphdr);
-  if (payload + 18 > data_end)
-    return TC_ACT_SHOT;
-
-  unsigned char *p2 = payload;
-  p2[2] = 0xab;
 
   return bpf_redirect(skb->ifindex, 0);
 }

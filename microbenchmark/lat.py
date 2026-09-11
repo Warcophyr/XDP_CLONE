@@ -17,6 +17,12 @@ import bench_common as bench
 from bench_common import launch_program, stop_program
 
 PROFILE_FILE = bench.profile("clonlat.py")
+
+# Must match profiles/clonlat.py: pg_id 1 is the uncloned probe that carries
+# the latency histogram, pg_id 2 the cloned load whose rx/tx ratio is the
+# fan-out actually observed.
+PG_PROBE = 1
+PG_LOAD = 2
 RESULTS_CSV_FILE = bench.result("latency_results.csv")
 SUMMARY_CSV_FILE = bench.result("latency_summary.csv")
 LATENCY_METRICS = [
@@ -29,6 +35,8 @@ LATENCY_METRICS = [
     "p99",
     "rx_tx_ratio",
     "copies",
+    "probe_samples",
+    "probe_tx",
 ]
 
 PORTS = [0]  # single port loopback
@@ -79,8 +87,16 @@ def _counter_total(counter_values, counter_name):
     return total
 
 
-def latency_stats(client, pg_id=1):
-    stats = client.get_pgid_stats([pg_id])
+def latency_stats(client, pg_id=PG_PROBE, load_pg_id=PG_LOAD):
+    """Latency of the probe stream, and the fan-out the load stream really got.
+
+    Two pg_ids on purpose. The probe is never cloned, so it yields one sample
+    per packet sent and its latency is the machine's; the load stream is the one
+    that gets cloned, so its rx/tx ratio is what says whether the application
+    actually produced the copies it was asked for.
+    """
+    wanted = [pg_id] if load_pg_id is None else [pg_id, load_pg_id]
+    stats = client.get_pgid_stats(wanted)
     latency_section = stats.get("latency")
     if not latency_section:
         raise RuntimeError("No latency section returned by TRex.")
@@ -89,18 +105,23 @@ def latency_stats(client, pg_id=1):
         raise RuntimeError("No flow_stats section returned by TRex.")
 
     latency_entry = _pgid_entry(latency_section, pg_id)
-    flow_entry = _pgid_entry(flow_section, pg_id)
     latency_values = latency_entry.get("latency", {})
     histogram = latency_values.get("histogram", {})
-    
 
-    rx_total = _counter_total(flow_entry.get("rx_pkts", {}), "rx_pkts")
-    tx_total = _counter_total(flow_entry.get("tx_pkts", {}), "tx_pkts")
-    if tx_total <= 0:
-        raise RuntimeError("tx_pkts total is zero, cannot compute copies.")
+    if load_pg_id is None:
+        rx_tx_ratio = 1
+        num_copies = 0
+    else:
+        load_entry = _pgid_entry(flow_section, load_pg_id)
+        rx_total = _counter_total(load_entry.get("rx_pkts", {}), "rx_pkts")
+        tx_total = _counter_total(load_entry.get("tx_pkts", {}), "tx_pkts")
+        if tx_total <= 0:
+            raise RuntimeError("tx_pkts total is zero, cannot compute copies.")
+        rx_tx_ratio = int(rx_total / tx_total + 0.5)
+        num_copies = rx_tx_ratio - 1
 
-    rx_tx_ratio = int(rx_total / tx_total + 0.5)
-    num_copies = rx_tx_ratio - 1
+    probe_entry = _pgid_entry(flow_section, pg_id)
+    probe_tx = _counter_total(probe_entry.get("tx_pkts", {}), "tx_pkts")
 
     # Percentiles and the maximum both come out of the histogram, which is the
     # only part of TRex's latency stats that clear_pgid_stats() really makes
@@ -122,8 +143,10 @@ def latency_stats(client, pg_id=1):
         "p90": percentiles[90],
         "p95": percentiles[95],
         "p99": percentiles[99],
-        "rx_pkts": rx_total,
-        "tx_pkts": tx_total,
+        "rx_pkts": rx_total if load_pg_id is not None else 0.0,
+        "tx_pkts": tx_total if load_pg_id is not None else 0.0,
+        "probe_samples": float(sum(int(v) for v in histogram.values())),
+        "probe_tx": probe_tx,
         "rx_tx_ratio": rx_tx_ratio,
         "copies": num_copies,
     }
@@ -190,6 +213,15 @@ def save_latency_summary_csv(results, csv_file=SUMMARY_CSV_FILE):
     # tqdm.write(f"Saved latency summary to {csv_file}")
 
 def setup_trex():
+    # The profile reads these; it is exec'd by TRex's loader, so the
+    # environment is the simplest way to hand it the rates.
+    os.environ["CLONLAT_LOAD_PPS"] = str(bench.LATENCY_LOAD_PPS)
+    os.environ["CLONLAT_PROBE_PPS"] = str(bench.LATENCY_PROBE_PPS)
+    tqdm.write(
+        f"Latency: probe {bench.LATENCY_PROBE_PPS} pps uncloned, "
+        f"fan-out load {bench.LATENCY_LOAD_PPS} pps"
+    )
+
     client = STLClient(server="100.78.72.16")
     client.connect()
     client.acquire(ports=PORTS, force=True)
@@ -241,7 +273,10 @@ def main():
                         sleep(2)
                         client.clear_pgid_stats(clear_flow_stats=True, clear_latency_stats=True)
                         sleep(5)
-                        result = latency_stats(client)
+                        result = latency_stats(
+                            client,
+                            load_pg_id=PG_LOAD if bench.LATENCY_LOAD_PPS else None,
+                        )
                         result["application"] = app_name
                         result["configured_copies"] = configured_copies
                         result["repetition"] = repetition
