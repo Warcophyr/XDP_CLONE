@@ -60,22 +60,35 @@ def app(directory, binary):
 # Latency is measured on a probe stream that is never cloned, while the fan-out
 # load runs beside it (profiles/clonlat.py).
 #
-# This is a *publish* rate, so the frames the machine emits are
-# LATENCY_LOAD_PPS * (copies + 1) and the offered load grows 65-fold across the
-# sweep. The rate therefore has to be low enough that even the last point stays
-# inside the weakest application's no-drop rate, or that point measures a
-# saturated machine rather than its latency: at 100k publishes the fan-out came
-# out as 40, 36 and 1 copies instead of 64, with milliseconds of queueing.
+# The load is held at a constant *frame* rate, not a constant publish rate: the
+# publish rate for a given copy count is LATENCY_LOAD_FPS // (copies + 1), so
+# every point of the sweep offers the machine the same work and the difference
+# between the columns is the fan-out mechanism rather than the load. A constant
+# publish rate does not do that -- the offered load then grows with the copy
+# count, 65-fold from one end of the sweep to the other, and the two effects
+# cannot be told apart. It also put the last point beyond capacity (the fan-out
+# came out as 40, 36 and 1 copies instead of 64) while leaving the first point
+# almost idle, which is where the run-to-run spread at low copy counts came
+# from.
 #
-# The binding case is tc-clone at 64 copies, whose measured NDR is 16k
-# publishes/s (results/ndr_summary.csv). 10k leaves every application inside its
-# own no-drop rate at every copy count -- tc at 64 copies, the tightest, sits at
-# about 63% of it. The price is that the low end of the sweep is nearly idle:
-# 10k frames/s at copies=0 against 12 Mpps of capacity.
-#
-# Set LATENCY_LOAD_PPS = 0 to drop the load stream entirely.
-LATENCY_LOAD_PPS = 10_000
+# 500k frames/s sits under every application's measured no-drop rate at every
+# copy count (results/ndr_summary.csv). The binding case is tc-clone at 64
+# copies, whose NDR is 1.03 Mframes/s, so this is about half of it; for the two
+# XDP applications it is a far smaller fraction, which is unavoidable when
+# comparing datapaths an order of magnitude apart in capacity.
+LATENCY_LOAD_FPS = 500_000
 LATENCY_PROBE_PPS = 1_000
+
+
+def latency_load_pps(copies):
+    """Publish rate that puts LATENCY_LOAD_FPS frames/s on the wire at @copies.
+
+    Rounded down and floored at 1, so that even a very large copy count still
+    offers some load rather than none.
+    """
+    if LATENCY_LOAD_FPS <= 0:
+        return 0
+    return max(1, LATENCY_LOAD_FPS // (copies + 1))
 
 LATENCY_APPS = {
     "xdp-clone": {

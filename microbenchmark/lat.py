@@ -41,13 +41,6 @@ LATENCY_METRICS = [
 
 PORTS = [0]  # single port loopback
 
-def launch_trex(client):
-    client.start(ports=PORTS, force=True)
-    # aspetta wamup traffico a pps
-    tqdm.write("Waiting for traffic to reach expected rate before stopping warmup...")
-    sleep(1)
-    return
-
 def stop_trex(client):
     tqdm.write("Stopping TRex traffic...")
     client.stop(ports=PORTS)
@@ -213,27 +206,45 @@ def save_latency_summary_csv(results, csv_file=SUMMARY_CSV_FILE):
     # tqdm.write(f"Saved latency summary to {csv_file}")
 
 def setup_trex():
-    # The profile reads these; it is exec'd by TRex's loader, so the
-    # environment is the simplest way to hand it the rates.
-    os.environ["CLONLAT_LOAD_PPS"] = str(bench.LATENCY_LOAD_PPS)
-    os.environ["CLONLAT_PROBE_PPS"] = str(bench.LATENCY_PROBE_PPS)
     tqdm.write(
         f"Latency: probe {bench.LATENCY_PROBE_PPS} pps uncloned, "
-        f"fan-out load {bench.LATENCY_LOAD_PPS} pps"
+        f"fan-out load held at {bench.LATENCY_LOAD_FPS} frames/s"
     )
 
     client = STLClient(server="100.78.72.16")
     client.connect()
     client.acquire(ports=PORTS, force=True)
     client.reset(ports=PORTS)
-
-    streams = STLProfile.load_py(
-                    PROFILE_FILE,
-                    direction=0,
-                    port_id=0,
-                ).get_streams()
-    client.add_streams(streams, ports=PORTS)
     return client
+
+
+def set_load(client, copies):
+    """Re-arm the streams so the load offers LATENCY_LOAD_FPS at @copies.
+
+    The publish rate has to change with the copy count to keep the frame rate
+    constant, and a stream's rate cannot be edited in place, so the profile is
+    reloaded and the traffic restarted for every point of the sweep. The profile
+    reads the two rates from the environment: it is exec'd by TRex's loader, so
+    that is the simplest way to reach it.
+    """
+    load_pps = bench.latency_load_pps(copies)
+    os.environ["CLONLAT_LOAD_PPS"] = str(load_pps)
+    os.environ["CLONLAT_PROBE_PPS"] = str(bench.LATENCY_PROBE_PPS)
+
+    client.stop(ports=PORTS)
+    client.reset(ports=PORTS)
+    streams = STLProfile.load_py(
+        PROFILE_FILE,
+        direction=0,
+        port_id=0,
+    ).get_streams()
+    client.add_streams(streams, ports=PORTS)
+    client.start(ports=PORTS, force=True)
+    tqdm.write(
+        f"  load {load_pps} publishes/s x {copies + 1} = "
+        f"{load_pps * (copies + 1)} frames/s"
+    )
+    sleep(1)
 
 def main():
     repetitions = 5
@@ -256,12 +267,12 @@ def main():
     )
     pbar = tqdm(total=total_iterations, desc="Esperimento", unit="test", leave=True)
 
-    launch_trex(client)
     try:
         for app_name, config in command_configs.items():
             base_command = config["base_command"]
             for configured_copies in config.get("clones", []):
                 tqdm.write(f"Starting {app_name} with configured copies={configured_copies}")
+                set_load(client, configured_copies)
                 process = launch_program(base_command, configured_copies)
                 if process is None:
                     raise RuntimeError(
@@ -275,7 +286,7 @@ def main():
                         sleep(5)
                         result = latency_stats(
                             client,
-                            load_pg_id=PG_LOAD if bench.LATENCY_LOAD_PPS else None,
+                            load_pg_id=PG_LOAD if bench.LATENCY_LOAD_FPS else None,
                         )
                         result["application"] = app_name
                         result["configured_copies"] = configured_copies
