@@ -103,9 +103,50 @@ if [ "$mode" = tc ]; then
     rsh "sudo $REMOTE_ROOT/scripts/node.sh tc-start $ranks $gw" >/dev/null
 fi
 
+# What the DUT costs, measured across the whole job.
+#
+# The loader process is not the thing to watch: it sits in pause() and burns
+# nothing, because the work is the XDP program, which runs in NAPI softirq on
+# whichever core takes the interrupt. Softirq time in cores is the number that
+# means something; the loader's own CPU is recorded beside it to show it is nil.
+cpu_snapshot() {
+    awk '/^cpu /{busy=$2+$3+$4+$7+$8+$9; printf "%d %d %d\n", busy, $8, busy+$5+$6}' /proc/stat
+}
+proc_cpu() {
+    [ -r "/proc/$1/stat" ] && awk '{print $14+$15}' "/proc/$1/stat" || echo 0
+}
+
+fpid=$(cat "$fanout_pid" 2>/dev/null || echo 0)
+read -r cpu_b0 cpu_sq0 cpu_t0 <<< "$(cpu_snapshot)"
+proc0=$(proc_cpu "$fpid")
+
+rsh "sudo rm -f /tmp/mpiclone-run/osu.log" >/dev/null 2>&1 || true
 rsh "sudo $REMOTE_ROOT/scripts/node.sh run $ranks $wire_mode $algo $bytes $iters /tmp/mpiclone-run/osu.log" || true
-rsh "cat /tmp/mpiclone-run/osu.log" > /tmp/mpiclone-osu.log
+
+read -r cpu_b1 cpu_sq1 cpu_t1 <<< "$(cpu_snapshot)"
+proc1=$(proc_cpu "$fpid")
+
+ncpu=$(nproc)
+hz=$(getconf CLK_TCK)
+# The parentheses matter: `>` in an awk printf argument list is a redirection.
+dut_busy=$(awk -v d=$((cpu_b1 - cpu_b0)) -v t=$((cpu_t1 - cpu_t0)) -v n="$ncpu" \
+    'BEGIN { printf "%.4f", (t > 0 ? d / t * n : 0) }')
+dut_softirq=$(awk -v d=$((cpu_sq1 - cpu_sq0)) -v t=$((cpu_t1 - cpu_t0)) -v n="$ncpu" \
+    'BEGIN { printf "%.4f", (t > 0 ? d / t * n : 0) }')
+dut_loader=$(awk -v d=$((proc1 - proc0)) -v hz="$hz" 'BEGIN { printf "%.3f", d / hz }')
+
+# Both copies go first. A run that fails leaves the previous one's log where
+# it was, and parsing that reports the last measurement again under this run's
+# labels -- which is how three different modes came out with the same latency
+# to the second decimal, and the same packet count, before anyone noticed.
+rm -f /tmp/mpiclone-osu.log
+rsh "cat /tmp/mpiclone-run/osu.log" > /tmp/mpiclone-osu.log 2>/dev/null || true
+if [ ! -s /tmp/mpiclone-osu.log ]; then
+    echo "the job produced no output; the run is not a measurement" >&2
+fi
 
 python3 "$here/parse.py" --mode "$mode" --algo "$algo" --ranks "$ranks" \
     --bytes "$bytes" --iters "$iters" --rep "$rep" \
+    --dut-busy-cores "$dut_busy" --dut-softirq-cores "$dut_softirq" \
+    --dut-loader-cpu-s "$dut_loader" \
     ${out:+--out "$out"} /tmp/mpiclone-osu.log

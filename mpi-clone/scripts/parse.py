@@ -18,7 +18,9 @@ STATS = re.compile(r"mpi-clone: rank (\d+)\s+(\d+) broadcasts, (\d+) packets sen
                    r"(\d+) timeouts")
 
 FIELDS = ["mode", "algo", "ranks", "bytes", "iters", "rep", "latency_us",
-          "root_packets_per_bcast", "total_packets", "timeouts", "ok", "note"]
+          "root_packets_per_bcast", "total_packets", "timeouts",
+          "dut_busy_cores", "dut_softirq_cores", "dut_loader_cpu_s",
+          "ok", "note"]
 
 
 def main():
@@ -27,6 +29,10 @@ def main():
     for f, t in (("mode", str), ("algo", str), ("ranks", int), ("bytes", int),
                  ("iters", int), ("rep", int)):
         ap.add_argument(f"--{f}", type=t, required=(f != "rep"), default=0)
+    # Measured on the DUT across the whole job, in cores rather than percent.
+    ap.add_argument("--dut-busy-cores", type=float, default=None)
+    ap.add_argument("--dut-softirq-cores", type=float, default=None)
+    ap.add_argument("--dut-loader-cpu-s", type=float, default=None)
     ap.add_argument("--out")
     a = ap.parse_args()
 
@@ -34,6 +40,11 @@ def main():
     row = {f: "" for f in FIELDS}
     row.update(mode=a.mode, algo=a.algo, ranks=a.ranks, bytes=a.bytes,
                iters=a.iters, rep=a.rep)
+    for k, v in (("dut_busy_cores", a.dut_busy_cores),
+                 ("dut_softirq_cores", a.dut_softirq_cores),
+                 ("dut_loader_cpu_s", a.dut_loader_cpu_s)):
+        if v is not None:
+            row[k] = round(v, 4)
 
     stats = STATS.findall(text)
     timeouts = sum(int(t) for _, _, _, t in stats)
@@ -59,7 +70,7 @@ def main():
 
     print(",".join(f"{k}={row[k]}" for k in
                    ("mode", "algo", "ranks", "bytes", "latency_us",
-                    "root_packets_per_bcast", "ok")))
+                    "root_packets_per_bcast", "dut_softirq_cores", "ok")))
 
     if a.out:
         new = not os.path.exists(a.out)

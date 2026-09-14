@@ -40,9 +40,12 @@ def main():
         lat = [float(r["latency_us"]) for r in rs]
         pk = [float(r["root_packets_per_bcast"]) for r in rs
               if r["root_packets_per_bcast"]]
+        sq = [float(r["dut_softirq_cores"]) for r in rs
+              if r.get("dut_softirq_cores") not in (None, "")]
         summary[k] = dict(n=len(rs), lat=st.median(lat),
                           sd=st.stdev(lat) if len(lat) > 1 else 0.0,
-                          pk=st.median(pk) if pk else None)
+                          pk=st.median(pk) if pk else None,
+                          sq=st.median(sq) if sq else None)
 
     for nranks in sorted({k[0] for k in summary}):
         for size in sorted({k[1] for k in summary if k[0] == nranks}):
@@ -67,12 +70,14 @@ def main():
     with open(path, "w", newline="") as fh:
         w = csv.writer(fh)
         w.writerow(["ranks", "bytes", "algo", "mode", "reps", "latency_us",
-                    "latency_sd", "root_packets_per_bcast"])
+                    "latency_sd", "root_packets_per_bcast",
+                    "dut_softirq_cores"])
         for k in sorted(summary, key=lambda k: (k[0], k[1], k[2], ORDER.index(k[3]))):
             s = summary[k]
             w.writerow([k[0], k[1], k[2], k[3], s["n"], f"{s['lat']:.3f}",
                         f"{s['sd']:.3f}",
-                        f"{s['pk']:.3f}" if s["pk"] is not None else ""])
+                        f"{s['pk']:.3f}" if s["pk"] is not None else "",
+                        f"{s['sq']:.4f}" if s["sq"] is not None else ""])
     print(f"summary in {path}")
 
 

@@ -81,3 +81,8 @@ done
 
 echo
 echo "results in $out"
+
+# The summary is part of the run, not a step to remember afterwards.
+if ! python3 "$here/report.py" "$out"; then
+    echo "the sweep finished but the summary failed; the rows are in $out" >&2
+fi

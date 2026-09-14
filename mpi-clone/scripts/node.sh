@@ -32,6 +32,17 @@ NS=${NS:-elec-r}
 LAUNCH_NS=${LAUNCH_NS:-elec-cl}
 DEV=${DEV:-mv}
 OSU=${OSU:-/opt/osu/libexec/osu-micro-benchmarks/mpi/collective}
+MPICLONE_CPUS=${MPICLONE_CPUS:-2-15}
+export MPICLONE_CPUS
+read -ra REPLICA_CPU_LIST <<< "$(
+    echo "$MPICLONE_CPUS" | tr ',' ' ' | while read -r spec; do
+        for part in $spec; do
+            case "$part" in
+                *-*) for (( c = ${part%%-*}; c <= ${part##*-}; c++ )); do echo "$c"; done ;;
+                *)   echo "$part" ;;
+            esac
+        done
+    done | tr '\n' ' ')"
 FANOUT_IP=${FANOUT_IP:-192.168.101.1}
 AGENT=${AGENT:-$here/nsagent.sh}
 
@@ -66,9 +77,18 @@ cmd_tc_stop() {
 }
 
 cmd_run() {
-    local n=$1 mode=$2 algo=$3 bytes=$4 iters=$5 log=$6 i hosts=$NS.0
+    local n=$1 mode=$2 algo=$3 bytes=$4 iters=$5 log=$6 i hosts yield=()
     hosts="${NS}0"
     for (( i = 1; i < n; i++ )); do hosts="$hosts,${NS}$i"; done
+
+    # More ranks than cores: Open MPI spins in opal_progress() by default, and
+    # with three spinning ranks to a core everything serialises -- a 31-rank
+    # broadcast came out at 5.5 ms against 24 us at seven. It switches to
+    # sched_yield() when it detects oversubscription, but here every rank is
+    # its own node with one slot, so it never does. Told explicitly instead.
+    if [ "$n" -gt "${#REPLICA_CPU_LIST[@]}" ]; then
+        yield=(--mca mpi_yield_when_idle 1)
+    fi
 
     rm -f "$log"
     ip netns exec "$LAUNCH_NS" env HWLOC_COMPONENTS=-gl DISPLAY= \
@@ -77,7 +97,7 @@ cmd_run() {
             --mca pml ob1 --mca btl tcp,self \
             --mca btl_tcp_if_include "$DEV" --mca oob_tcp_if_include "$DEV" \
             --mca btl_tcp_disable_family 6 \
-            --bind-to none \
+            --bind-to none "${yield[@]}" \
             -x LD_PRELOAD="$root/libmpiclone.so" \
             -x MPICLONE_MODE="$mode" -x MPICLONE_ALGO="$algo" \
             -x MPICLONE_FANOUT="$FANOUT_IP" -x MPICLONE_VERBOSE=1 \
