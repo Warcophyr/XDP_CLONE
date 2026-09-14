@@ -72,11 +72,12 @@ cmd_run() {
 
     rm -f "$log"
     ip netns exec "$LAUNCH_NS" env HWLOC_COMPONENTS=-gl DISPLAY= \
-        mpirun --allow-run-as-root \
+        taskset -c "${LAUNCH_CORE:-1}" mpirun --allow-run-as-root \
             --mca plm_rsh_agent "$AGENT" \
             --mca pml ob1 --mca btl tcp,self \
             --mca btl_tcp_if_include "$DEV" --mca oob_tcp_if_include "$DEV" \
             --mca btl_tcp_disable_family 6 \
+            --bind-to none \
             -x LD_PRELOAD="$root/libmpiclone.so" \
             -x MPICLONE_MODE="$mode" -x MPICLONE_ALGO="$algo" \
             -x MPICLONE_FANOUT="$FANOUT_IP" -x MPICLONE_VERBOSE=1 \

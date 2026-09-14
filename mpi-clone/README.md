@@ -103,7 +103,14 @@ worth writing down.
    it because the kernel counts that as `UdpNoPorts`. It looked exactly like a
    0.05% packet loss. The socket is bound first now.
 
-A fifth, from the measurement rather than the setup: **`MPI_Bcast` does not
+5. **No core binding at all.** Open MPI binds per node, and with one rank per
+   namespace every rank is its own node, so its idea of binding is none: all
+   seven came out with mask `0-31`, on whatever core the scheduler picked, SMT
+   siblings included. Latency then moved by a factor of four between rank
+   counts — in the *native* MPI point as much as in ours, which is what gave it
+   away. `scripts/nsagent.sh` pins rank i to core `MPICLONE_CORE_BASE + i`.
+
+A sixth, from the measurement rather than the setup: **`MPI_Bcast` does not
 synchronise**. Timing a loop of them at the root measures how fast it can
 enqueue sends, not how long a broadcast takes — a hand-written loop reported
 0.57 µs where point-to-point was 25.5. `osu_bcast` gets this right, which is
