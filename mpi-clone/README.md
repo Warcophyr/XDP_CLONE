@@ -116,6 +116,48 @@ enqueue sends, not how long a broadcast takes — a hand-written loop reported
 0.57 µs where point-to-point was 25.5. `osu_bcast` gets this right, which is
 why it is what runs here.
 
+## What the numbers support, and what they do not
+
+Eight bytes, three repetitions, `osu_bcast`, both machines tuned:
+
+| | 3 ranks | 5 ranks | 7 ranks |
+|---|---|---|---|
+| **linear** — UDP naive | 24.8 µs (2 pkt) | 14.5 (4) | 21.5 (6) |
+| TC clone | 25.7 (1) | 11.7 (1) | 18.8 (1) |
+| XDP_CLONE | **23.0** (1) | **9.7** (1) | **13.4** (1) |
+| **binomial** — UDP naive | 26.7 (2) | 17.4 (3) | 25.5 (3) |
+| TC clone | 25.9 (1) | 16.1 (1) | 24.7 (1) |
+| XDP_CLONE | **24.2** (1) | **14.7** (1) | **22.9** (1) |
+| **ring** — UDP / TC / XDP | 29.8 / 29.9 / 31.2 | 32.7 / 34.1 / 33.2 | 59.8 / 60.3 / 57.5 |
+
+**Supported:** at a fixed rank count the ordering is UDP > TC > XDP, in every
+one of the six flat and tree cases, and the margin grows with the fan-out —
+1.08x, 1.50x, 1.60x over the naive point for the flat schedule at three, five
+and seven ranks, which is the shape you would expect from a root that saves
+one, three and five sends. The packet counts beside each number are what say
+the offload happened at all.
+
+**Not supported:** comparing absolute latency *across* rank counts. Five ranks
+comes out faster than either three or seven in every point, the native one
+included, by far more than the run-to-run noise. The likely cause is that
+nothing steers grecale's NIC interrupts away from the cores the ranks are
+pinned to, so how the RSS hash falls changes with the number of flows.
+Upstream Electrode pins its IRQs to one core for exactly this reason, and doing
+the same here is the obvious next step.
+
+**The ring is the control.** Nothing separates the three points there, at any
+rank count, because a ring hop sends exactly one packet and there is nothing to
+duplicate. That is the answer to "can the clone accelerate a ring broadcast",
+and it is no.
+
+### Tuning is not optional
+
+Six runs of one configuration, untuned, gave 19.2 to 31.7 µs — a factor of
+1.65, which would swamp every difference in the table. The same six, with
+`electrode/scripts/tune.sh on` (interrupt coalescing off, governor
+`performance`), gave 22.7 to 26.1. `sweep.sh` tunes and puts it back; `run.sh`
+does not, so a single run taken on its own is worth ±30%.
+
 ## What is not handled
 
 A lost datagram is counted, not recovered: the receive has a timeout, the count
