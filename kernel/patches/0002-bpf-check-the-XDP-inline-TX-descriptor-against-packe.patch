@@ -1,0 +1,366 @@
+From 4aa43db676500aaaa22c769ae0b2b68c7774e27d Mon Sep 17 00:00:00 2001
+From: VladimiroPaschali <vladimiropaschali@gmail.com>
+Date: Wed, 16 Sep 2026 15:29:33 +0000
+Subject: [PATCH] bpf: check the XDP inline TX descriptor against packet writes
+
+A program that stamps XDP_TX_INLINE_MAGIC into its metadata area is on
+the driver's shared-page path, where the packet bytes are the frames
+already queued for the other emissions, so it must not write into the
+packet.
+
+A metadata area the program grew itself no longer counts as the driver's
+clone metadata either, without which no inline program passes the check
+on the clone actions at all.
+---
+ include/linux/bpf_verifier.h   |  16 ++++
+ include/uapi/linux/bpf.h       |  20 ++++
+ kernel/bpf/verifier.c          | 167 ++++++++++++++++++++++++++++++++-
+ tools/include/uapi/linux/bpf.h |  20 ++++
+ 4 files changed, 220 insertions(+), 3 deletions(-)
+
+diff --git a/include/linux/bpf_verifier.h b/include/linux/bpf_verifier.h
+index 49227388e..6d0a75353 100644
+--- a/include/linux/bpf_verifier.h
++++ b/include/linux/bpf_verifier.h
+@@ -476,6 +476,12 @@ struct bpf_verifier_state {
+ 	 */
+ 	enum bpf_xdp_meta_check xdp_meta_check;
+ 	u16 xdp_meta_range;
++	/* the program has grown the metadata area itself on this path, so a
++	 * data_meta vs data comparison from here on measures its own area and
++	 * says nothing about what the driver put there, see
++	 * try_mark_xdp_meta_check()
++	 */
++	bool xdp_meta_grown;
+ };
+ 
+ #define bpf_get_spilled_reg(slot, frame, mask)				\
+@@ -716,6 +722,16 @@ struct bpf_verifier_env {
+ 	bool bypass_spec_v4;
+ 	bool seen_direct_write;
+ 	bool seen_exception;
++	/* XDP inline TX mode: whether the program stamps XDP_TX_INLINE_MAGIC
++	 * into its metadata area, whether it writes into the packet, and the
++	 * first instruction that does each. Whole-program facts rather than
++	 * per-path ones, for the reason given above xdp_value_is_inline_magic();
++	 * check_xdp_inline_pkt_write() is where they meet.
++	 */
++	bool xdp_inline_stamped;
++	bool xdp_pkt_written;
++	u32 xdp_inline_stamp_insn;
++	u32 xdp_pkt_write_insn;
+ 	struct bpf_insn_aux_data *insn_aux_data; /* array of per-insn state */
+ 	const struct bpf_line_info *prev_linfo;
+ 	struct bpf_verifier_log log;
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index 8dbde0454..3c7f0fdaf 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -6364,6 +6364,26 @@ enum xdp_action {
+  */
+ #define XDP_CLONE_META_SIZE	4
+ 
++/* Cookie an XDP program stamps into the last word of the three-word TX
++ * descriptor it writes at xdp_md->data_meta, to ask the driver for the inline
++ * TX path: the NIC prepends a header the program leaves in that same area to
++ * the packet as it DMAs it, so nothing in the packet is copied or moved to
++ * make room.
++ *
++ *	u32 *desc = (void *)(long)ctx->data_meta;
++ *
++ *	desc[0] = tag;                   TX flow table metadata
++ *	desc[1] = inline_hdr_size;       header sits at desc + 12
++ *	desc[2] = XDP_TX_INLINE_MAGIC;   what makes the descriptor opt-in
++ *
++ * A stamped packet is emitted straight out of the RX page, which it shares
++ * with every copy XDP_CLONE_TX asked for, so its bytes must stay as they are:
++ * the frames queued for the other emissions are those same bytes, and the DMA
++ * is asynchronous. The verifier turns down a program that stamps this cookie
++ * and writes into the packet anywhere.
++ */
++#define XDP_TX_INLINE_MAGIC	0xa7d9c0deU
++
+ /* user accessible metadata for XDP packet hook
+  * new fields must be added to the end of this structure
+  */
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index b1fa8f1f3..e205d3cae 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -1423,6 +1423,7 @@ static int copy_verifier_state(struct bpf_verifier_state *dst_state,
+ 	dst_state->used_as_loop_entry = src->used_as_loop_entry;
+ 	dst_state->xdp_meta_check = src->xdp_meta_check;
+ 	dst_state->xdp_meta_range = src->xdp_meta_range;
++	dst_state->xdp_meta_grown = src->xdp_meta_grown;
+ 	for (i = 0; i <= src->curframe; i++) {
+ 		dst = dst_state->frame[i];
+ 		if (!dst) {
+@@ -6708,6 +6709,103 @@ static bool get_func_retval_range(struct bpf_prog *prog,
+ 	return false;
+ }
+ 
++/* ---- XDP inline TX mode --------------------------------------------------
++ *
++ * A program asks the driver for the inline TX path by stamping a three-word
++ * descriptor into its own metadata area, the last word of it being
++ * XDP_TX_INLINE_MAGIC. The NIC then prepends the header the program left in
++ * that area to the packet as it DMAs it, and the driver emits the packet, and
++ * every copy XDP_CLONE_TX asked for, straight out of the RX page: no page
++ * allocation and no byte copy per copy.
++ *
++ * What pays for that is the packet itself. All of those emissions point at the
++ * same bytes and the DMA is asynchronous, so a write into the packet in one
++ * run of the program lands in the frames already queued for the other ones. A
++ * program that stamps the descriptor may write its metadata area and nothing
++ * else. bpf_xdp_adjust_head() counts as writing the packet -- it memmoves the
++ * metadata over the packet's first bytes -- while bpf_xdp_adjust_meta() does
++ * not, it only moves data_meta inside the headroom.
++ *
++ * The rule holds over the whole program rather than per path, because that is
++ * how the hardware sees it: the driver takes the shared page from the stamp on
++ * the original, and then re-runs the program once per copy, where it may well
++ * take another path. A stamp on one path is a stamp for all of them.
++ *
++ * Same blind spot as the clone actions: a program that builds the magic at
++ * runtime, or writes it through a helper, is not recognised as stamping, and
++ * neither is a write reaching the packet through an XDP dynptr. This is a
++ * correctness check on the program and not a kernel safety boundary -- the
++ * page and the references on it belong to the driver whatever the program
++ * does, and the driver validates the descriptor it reads back.
++ */
++static bool xdp_value_is_inline_magic(u64 val, int size)
++{
++	switch (size) {
++	case 4:
++		return (u32)val == XDP_TX_INLINE_MAGIC;
++	case 8:
++		/* the compiler is free to fold the descriptor's last two words
++		 * into a single store
++		 */
++		return (u32)val == XDP_TX_INLINE_MAGIC ||
++		       (u32)(val >> 32) == XDP_TX_INLINE_MAGIC;
++	default:
++		return false;
++	}
++}
++
++/* A write into the packet, wherever it comes from: a store through a
++ * PTR_TO_PACKET, a helper handed one as its destination, or a helper that
++ * rewrites the packet on the program's behalf.
++ */
++static void mark_xdp_pkt_written(struct bpf_verifier_env *env, int insn_idx)
++{
++	if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_XDP ||
++	    env->xdp_pkt_written)
++		return;
++
++	env->xdp_pkt_written = true;
++	env->xdp_pkt_write_insn = insn_idx;
++}
++
++/* Is this store into the metadata area the descriptor's magic word? @size is
++ * in bytes, and @value_regno is -1 for BPF_ST, whose value sits in the
++ * instruction rather than in a register.
++ *
++ * The offset the magic is written at is not looked at. The driver reads it
++ * back as the third word of the descriptor, but the cookie is what identifies
++ * the request either way, and a program has no reason to write it anywhere
++ * else.
++ */
++static void try_mark_xdp_inline_stamp(struct bpf_verifier_env *env,
++				      int insn_idx, int size, int value_regno)
++{
++	const struct bpf_insn *insn = &env->prog->insnsi[insn_idx];
++	const struct bpf_reg_state *val;
++	u64 value;
++
++	if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_XDP ||
++	    env->xdp_inline_stamped)
++		return;
++
++	if (value_regno >= 0) {
++		val = cur_regs(env) + value_regno;
++		if (val->type != SCALAR_VALUE || !tnum_is_const(val->var_off))
++			return;
++		value = val->var_off.value;
++	} else if (BPF_CLASS(insn->code) == BPF_ST) {
++		value = (u64)(s64)insn->imm;
++	} else {
++		return;
++	}
++
++	if (!xdp_value_is_inline_magic(value, size))
++		return;
++
++	env->xdp_inline_stamped = true;
++	env->xdp_inline_stamp_insn = insn_idx;
++}
++
+ /* check whether memory at (regno + off) is accessible for t = (read | write)
+  * if t==write, value_regno is a register which value is stored into memory
+  * if t==read, value_regno is a register which will receive the value from memory
+@@ -6891,6 +6989,16 @@ static int check_mem_access(struct bpf_verifier_env *env, int insn_idx, u32 regn
+ 		err = check_packet_access(env, regno, off, size, false);
+ 		if (!err && t == BPF_READ && value_regno >= 0)
+ 			mark_reg_unknown(env, regs, value_regno);
++		/* Inline TX mode: writing the packet is what is forbidden,
++		 * writing the metadata area is how the mode is asked for.
++		 */
++		if (!err && t == BPF_WRITE) {
++			if (base_type(reg->type) == PTR_TO_PACKET)
++				mark_xdp_pkt_written(env, insn_idx);
++			else
++				try_mark_xdp_inline_stamp(env, insn_idx, size,
++							  value_regno);
++		}
+ 	} else if (reg->type == PTR_TO_FLOW_KEYS) {
+ 		if (t == BPF_WRITE && value_regno >= 0 &&
+ 		    is_pointer_value(env, value_regno)) {
+@@ -7239,6 +7347,10 @@ static int check_helper_mem_access(struct bpf_verifier_env *env, int regno,
+ 	switch (base_type(reg->type)) {
+ 	case PTR_TO_PACKET:
+ 	case PTR_TO_PACKET_META:
++		/* a helper writing into the packet on the program's behalf */
++		if (access_type == BPF_WRITE &&
++		    base_type(reg->type) == PTR_TO_PACKET)
++			mark_xdp_pkt_written(env, env->insn_idx);
+ 		return check_packet_access(env, regno, reg->off, access_size,
+ 					   zero_size_allowed);
+ 	case PTR_TO_MAP_KEY:
+@@ -10161,10 +10273,14 @@ static void mark_xdp_meta_adjusted(struct bpf_verifier_env *env,
+ 	if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_XDP)
+ 		return;
+ 	/* A negative offset only grows the metadata area, it can never turn a
+-	 * packet that carries clone metadata into one that doesn't.
++	 * packet that carries clone metadata into one that doesn't. What it
++	 * does end is the program's ability to measure the driver's metadata:
++	 * from here on the area is as wide as the program made it.
+ 	 */
+-	if (off_reg->type == SCALAR_VALUE && off_reg->s32_max_value <= 0)
++	if (off_reg->type == SCALAR_VALUE && off_reg->s32_max_value <= 0) {
++		env->cur_state->xdp_meta_grown = true;
+ 		return;
++	}
+ 
+ 	env->cur_state->xdp_meta_check = BPF_XDP_META_ADJUSTED;
+ 	env->cur_state->xdp_meta_range = 0;
+@@ -10486,6 +10602,16 @@ static int check_helper_call(struct bpf_verifier_env *env, struct bpf_insn *insn
+ 	if (func_id == BPF_FUNC_xdp_adjust_meta)
+ 		mark_xdp_meta_adjusted(env, &regs[BPF_REG_2]);
+ 
++	/* Helpers that rewrite the packet themselves: adjust_head() memmoves
++	 * the metadata over its first bytes, adjust_tail() zeroes what it adds
++	 * at the end, store_bytes() writes into it outright. adjust_meta() is
++	 * not one of them, it stays inside the headroom.
++	 */
++	if (func_id == BPF_FUNC_xdp_adjust_head ||
++	    func_id == BPF_FUNC_xdp_adjust_tail ||
++	    func_id == BPF_FUNC_xdp_store_bytes)
++		mark_xdp_pkt_written(env, insn_idx);
++
+ 	/* reset caller saved regs */
+ 	for (i = 0; i < CALLER_SAVED_REGS; i++) {
+ 		mark_reg_not_init(env, regs, caller_saved[i]);
+@@ -14826,6 +14952,21 @@ static void mark_ptr_or_null_regs(struct bpf_verifier_state *vstate, u32 regno,
+  * one where the metadata is known to be there, the other one is where it is
+  * (partially) missing. Only the size the comparison was made against matters,
+  * pointers themselves are not tracked across the exit.
++ *
++ * Comparisons made after the program has grown the metadata area itself are
++ * not about the driver's metadata at all -- they measure the room the program
++ * asked for, which is the shape every inline TX program has:
++ *
++ *	if (ctx->data_meta + sizeof(__u32) > ctx->data) {
++ *		bpf_xdp_adjust_meta(ctx, -AXDP_TX_DESC_LEN);
++ *		if (ctx->data_meta + AXDP_TX_DESC_LEN <= ctx->data)
++ *			... stamp the descriptor ...
++ *		return XDP_CLONE_TX(n);
++ *	}
++ *
++ * Reading the second comparison as 'the metadata is there' would turn that
++ * program into a nested clone. So once xdp_meta_grown is set, what the path
++ * knows is what it proved before the grow, and nothing more.
+  */
+ static void try_mark_xdp_meta_check(struct bpf_verifier_env *env,
+ 				    const struct bpf_insn *insn,
+@@ -14842,6 +14983,10 @@ static void try_mark_xdp_meta_check(struct bpf_verifier_env *env,
+ 	if (resolve_prog_type(env->prog) != BPF_PROG_TYPE_XDP)
+ 		return;
+ 
++	/* both branches carry it, other_branch is a copy of this one */
++	if (this_branch->xdp_meta_grown || other_branch->xdp_meta_grown)
++		return;
++
+ 	if (dst_reg->type == PTR_TO_PACKET_META &&
+ 	    reg_is_init_pkt_pointer(src_reg, PTR_TO_PACKET))
+ 		meta_on_dst = true;
+@@ -15505,6 +15650,20 @@ static int check_xdp_clone_retval(struct bpf_verifier_env *env, int regno,
+ 	}
+ }
+ 
++/* The two halves of the inline TX rule meet here, once every reachable
++ * instruction of the program has been walked: a program that stamps the
++ * descriptor must not write into the packet.
++ */
++static int check_xdp_inline_pkt_write(struct bpf_verifier_env *env)
++{
++	if (!env->xdp_inline_stamped || !env->xdp_pkt_written)
++		return 0;
++
++	verbose(env, "insn %u stamps the XDP inline TX descriptor into xdp_md->data_meta, which emits the packet out of a page shared with every copy of it, so insn %u must not write into the packet. Write the metadata area instead, or leave the stamp out to get a page per copy\n",
++		env->xdp_inline_stamp_insn, env->xdp_pkt_write_insn);
++	return -EACCES;
++}
++
+ static int check_return_code(struct bpf_verifier_env *env, int regno, const char *reg_name)
+ {
+ 	const char *exit_ctx = "At program exit";
+@@ -16994,7 +17153,8 @@ static bool states_equal(struct bpf_verifier_env *env,
+ 	 * to different verdicts in check_xdp_clone_retval().
+ 	 */
+ 	if (old->xdp_meta_check != cur->xdp_meta_check ||
+-	    old->xdp_meta_range != cur->xdp_meta_range)
++	    old->xdp_meta_range != cur->xdp_meta_range ||
++	    old->xdp_meta_grown != cur->xdp_meta_grown)
+ 		return false;
+ 
+ 	if (xdp_clone_exit_differs(env, old, cur))
+@@ -21310,6 +21470,7 @@ int bpf_check(struct bpf_prog **prog, union bpf_attr *attr, bpfptr_t uattr, __u3
+ 
+ 	ret = do_check_main(env);
+ 	ret = ret ?: do_check_subprogs(env);
++	ret = ret ?: check_xdp_inline_pkt_write(env);
+ 
+ 	if (ret == 0 && bpf_prog_is_offloaded(env->prog->aux))
+ 		ret = bpf_prog_offload_finalize(env);
+diff --git a/tools/include/uapi/linux/bpf.h b/tools/include/uapi/linux/bpf.h
+index 2739b9896..d0d9d8332 100644
+--- a/tools/include/uapi/linux/bpf.h
++++ b/tools/include/uapi/linux/bpf.h
+@@ -6367,6 +6367,26 @@ enum xdp_action {
+  */
+ #define XDP_CLONE_META_SIZE	4
+ 
++/* Cookie an XDP program stamps into the last word of the three-word TX
++ * descriptor it writes at xdp_md->data_meta, to ask the driver for the inline
++ * TX path: the NIC prepends a header the program leaves in that same area to
++ * the packet as it DMAs it, so nothing in the packet is copied or moved to
++ * make room.
++ *
++ *	u32 *desc = (void *)(long)ctx->data_meta;
++ *
++ *	desc[0] = tag;                   TX flow table metadata
++ *	desc[1] = inline_hdr_size;       header sits at desc + 12
++ *	desc[2] = XDP_TX_INLINE_MAGIC;   what makes the descriptor opt-in
++ *
++ * A stamped packet is emitted straight out of the RX page, which it shares
++ * with every copy XDP_CLONE_TX asked for, so its bytes must stay as they are:
++ * the frames queued for the other emissions are those same bytes, and the DMA
++ * is asynchronous. The verifier turns down a program that stamps this cookie
++ * and writes into the packet anywhere.
++ */
++#define XDP_TX_INLINE_MAGIC	0xa7d9c0deU
++
+ /* user accessible metadata for XDP packet hook
+  * new fields must be added to the end of this structure
+  */

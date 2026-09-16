@@ -22,7 +22,8 @@ mountpoint -q $BPFFS || mount -t bpf bpf $BPFFS 2>/dev/null
 echo "kernel: $(uname -r)"
 fail=0
 
-for src in t*.bpf.c; do
+# sort -V so that t10 comes after t9 instead of after t1
+for src in $(ls t*.bpf.c | sort -V); do
 	name=${src%%.*}
 	obj=${src%.c}.o
 	expect=$(sed -n 's/.*EXPECT: \([A-Z]*\).*/\1/p' "$src" | head -1)
