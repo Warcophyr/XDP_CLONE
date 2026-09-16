@@ -3,4 +3,4 @@ bpf/*.bpf.o
 bpf/mpi_fanout
 bpf/mpi_tc
 ranks.conf
-results/
+results*/
